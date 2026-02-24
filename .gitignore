@@ -13,6 +13,7 @@ env
 db/
 dev.db
 data/
+pricing/*.json
 
 # Logs
 logs/
