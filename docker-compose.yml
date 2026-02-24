@@ -1,0 +1,147 @@
+services:
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    container_name: aws-cost-opt-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-costadmin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-costpassword}
+      POSTGRES_DB: ${POSTGRES_DB:-cost_optimization}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+      - ./database/init:/docker-entrypoint-initdb.d:ro
+    ports:
+      - "${POSTGRES_PORT:-5435}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-costadmin} -d ${POSTGRES_DB:-cost_optimization}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - cost-opt-network
+    env_file:
+      - .env.docker
+
+
+  # Streamlit Application
+  streamlit-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aws-cost-opt-app
+    restart: unless-stopped
+    environment:
+      # Database Configuration (from .env)
+      DATABASE_URL: ${DATABASE_URL}
+      
+      # Environment
+      ENVIRONMENT: ${ENVIRONMENT:-production}
+      
+      # AWS Credentials (pass through from .env)
+      AWS_ACCESS_KEY_ID: ${AWS_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      
+      # AWS Green Environment
+      AWS_GREEN_ACCESS_KEY_ID: ${AWS_GREEN_ACCESS_KEY_ID}
+      AWS_GREEN_SECRET_ACCESS_KEY: ${AWS_GREEN_SECRET_ACCESS_KEY}
+      AWS_GREEN_DEFAULT_REGION: ${AWS_GREEN_DEFAULT_REGION:-us-east-1}
+      
+      # AWS Red Environment
+      AWS_RED_ACCESS_KEY_ID: ${AWS_RED_ACCESS_KEY_ID}
+      AWS_RED_SECRET_ACCESS_KEY: ${AWS_RED_SECRET_ACCESS_KEY}
+      AWS_RED_DEFAULT_REGION: ${AWS_RED_DEFAULT_REGION:-us-east-1}
+      
+      # SQL Echo (for debugging)
+      SQL_ECHO: ${SQL_ECHO:-false}
+      
+      # Pricing JSON Configuration
+      PRICING_JSON_DIR: ${PRICING_JSON_DIR:-/app/pricing}
+      EC2_PRICING_JSON_PATH: ${EC2_PRICING_JSON_PATH:-/app/pricing/ec2_pricing.json}
+      RDS_PRICING_JSON_PATH: ${RDS_PRICING_JSON_PATH:-/app/pricing/rds_pricing.json}
+      S3_PRICING_JSON_PATH: ${S3_PRICING_JSON_PATH:-/app/pricing/s3_pricing.json}
+      
+      # Streamlit Configuration
+      STREAMLIT_SERVER_PORT: 8501
+      STREAMLIT_SERVER_ADDRESS: 0.0.0.0
+      STREAMLIT_SERVER_HEADLESS: "true"
+      STREAMLIT_BROWSER_GATHER_USAGE_STATS: "false"
+    ports:
+      - "${STREAMLIT_PORT:-8501}:8501"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      # Mount for persistent logs
+      - ./logs:/app/logs
+      # Mount for pricing JSON files (required for AWS pricing data)
+      # Set PRICING_JSON_DIR in .env to point to your pricing directory
+      # e.g., PRICING_JSON_DIR=/Users/SRD11/Desktop/PowerBIProject/pricing
+      - ${PRICING_JSON_DIR:-./pricing}:/app/pricing:ro
+      # Mount for local development (optional - remove in production)
+      - ./ui:/app/ui:ro
+      - ./core:/app/core:ro
+      - ./analysis:/app/analysis:ro
+      - ./etl:/app/etl:ro
+      - ./services:/app/services:ro
+      - ./utils:/app/utils:ro
+      - ./database:/app/database:ro
+    networks:
+      - cost-opt-network
+    env_file:
+      - .env.docker
+
+  # ngrok - Secure tunnel for external access
+  ngrok:
+    image: ngrok/ngrok:latest
+    container_name: aws-cost-opt-ngrok
+    restart: unless-stopped
+    command:
+      - "http"
+      - "streamlit-app:8501"
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTH_TOKEN}
+    ports:
+      - "${NGROK_PORT:-4040}:4040"
+    depends_on:
+      - streamlit-app
+    networks:
+      - cost-opt-network
+    env_file:
+      - .env.docker
+
+  # pgAdmin (Database Management UI)
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: aws-cost-opt-pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL: ${PGADMIN_EMAIL:-admin@localhost.com}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD:-admin}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+      PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED: "False"
+    ports:
+      - "${PGADMIN_PORT:-5050}:80"
+    depends_on:
+      - postgres
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    networks:
+      - cost-opt-network
+    env_file:
+      - .env.docker
+
+# Named Volumes
+volumes:
+  postgres_data:
+    driver: local
+  pgadmin_data:
+    driver: local
+
+# Networks
+networks:
+  cost-opt-network:
+    driver: bridge

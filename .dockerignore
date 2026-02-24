@@ -1,0 +1,75 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+ENV/
+env.bak/
+.venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Git
+.git/
+.gitignore
+/data/(*).db
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*
+
+# Docker
+Dockerfile
+docker-compose*.yml
+.dockerignore
+
+# Database files (will be created in container)
+*.db
+*.sqlite
+*.sqlite3
+data/
+
+# Pricing JSON files (mounted from host)
+pricing/
+
+# Logs
+logs/
+*.log
+
+# Environment files (sensitive)
+.env
+.env.*
+!.env.example
+
+# Archives
+*.zip
+Archive*/
+dumps/
+
+# Documentation
+*.md
+docs/
+plans/
+
+# Tests
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# macOS
+.DS_Store
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
