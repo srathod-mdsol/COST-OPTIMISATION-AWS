@@ -4,7 +4,6 @@ from datetime import datetime, timezone, timedelta
 from services.base_manager import BaseServiceManager
 from utils.rate_limiter import rate_limiter
 from core.logger import setup_logger
-import streamlit as st
 from core.config import Config
 from core.constants import (
     SECONDS_PER_HOUR,
@@ -103,6 +102,8 @@ class RDSManager(BaseServiceManager):
                         'allocated_storage': db['AllocatedStorage'],
                         'storage_type': db['StorageType'],
                         'multi_az': db['MultiAZ'],
+                        'deployment_option': 'Multi-AZ' if db.get('MultiAZ') else 'Single-AZ',
+                        'license_model': db.get('LicenseModel', ''),
                         'availability_zone': az,
                         'endpoint': db.get('Endpoint', {}).get('Address'),
                         'raw_data': json.dumps({'tags': tags}),

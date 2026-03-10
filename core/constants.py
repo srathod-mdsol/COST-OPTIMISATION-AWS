@@ -12,8 +12,14 @@ to improve maintainability and make changes easier.
 # Number of hours in a typical billing month (730 hours = 30.42 days)
 HOURS_PER_MONTH: int = 730
 
+# Number of hours in a year (8760 hours = 365 days)
+HOURS_PER_YEAR: int = 8760
+
 # Number of days in a typical billing month
 DAYS_PER_MONTH: int = 30
+
+# Days per year for calculations
+DAYS_PER_YEAR: int = 365
 
 # Time conversion (seconds)
 SECONDS_PER_MINUTE: int = 60
@@ -26,9 +32,6 @@ DEFAULT_ACTIVITY_THRESHOLD_DAYS: int = 30
 
 # Grace period percentage for activity detection (10% of threshold)
 ACTIVITY_GRACE_PERCENTAGE: float = 0.10
-
-# S3 grace period percentage (S3 is typically accessed less frequently)
-S3_GRACE_PERCENTAGE: float = 0.25
 
 # Default hours for CloudWatch metrics retrieval
 DEFAULT_CLOUDWATCH_HOURS: int = 24
@@ -102,9 +105,11 @@ BITS_PER_BYTE: int = 8
 EBS_GP3_BASE_IOPS: int = 3000
 EBS_GP3_BASE_THROUGHPUT_MBPS: int = 125
 
-# Default storage costs (fallbacks if API fails)
-DEFAULT_EBS_STORAGE_COST: float = 0.10
-DEFAULT_RDS_STORAGE_COST: float = 0.115
+# NOTE: Storage costs should be fetched from AWS Pricing API
+# Do not hardcode default prices - run pricing ETL to populate database
+# The following are placeholders only and should NOT be used for calculations
+DEFAULT_EBS_STORAGE_COST: float = None  # Must fetch from API
+DEFAULT_RDS_STORAGE_COST: float = None  # Must fetch from API
 
 
 # =============================================================================
@@ -142,9 +147,6 @@ NETWORK_IDLE_THRESHOLD: float = 1000.0
 # Disk activity thresholds (bytes)
 DISK_READ_IDLE_THRESHOLD: float = 1000.0
 DISK_WRITE_IDLE_THRESHOLD: float = 1000.0
-
-# S3 request threshold
-S3_REQUESTS_IDLE_THRESHOLD: float = 10.0
 
 
 # =============================================================================
@@ -199,25 +201,6 @@ DEFAULT_IDLE_SCORE_THRESHOLD: int = 50
 
 
 # =============================================================================
-# S3 STORAGE CLASS COSTS (USD per GB per month)
-# =============================================================================
-
-S3_STORAGE_COSTS: dict = {
-    'StandardStorage': 0.023,
-    'IntelligentTieringFrequentAccessStorage': 0.023,
-    'IntelligentTieringInfrequentAccessStorage': 0.0125,
-    'StandardIASetupStorage': 0.0125,
-    'OneZoneIASetupStorage': 0.01,
-    'GlacierInstantRetrievalStorage': 0.004,
-    'GlacierFlexibleRetrievalStorage': 0.0036,
-    'GlacierDeepArchiveStorage': 0.00099
-}
-
-# Default S3 storage class
-DEFAULT_S3_STORAGE_CLASS: str = 'StandardStorage'
-
-
-# =============================================================================
 # AWS Location to Region Code mapping
 AWS_LOCATION_TO_REGION: dict = {
     # US Regions
@@ -245,7 +228,7 @@ AWS_LOCATION_TO_REGION: dict = {
     'Asia Pacific (Jakarta)': 'ap-southeast-3',
     'Asia Pacific (Melbourne)': 'ap-southeast-4',
     # South America
-    'South America (Sao Paulo)': 'sa-east-1',
+    'South America (São Paulo)': 'sa-east-1',
     # Canada
     'Canada (Central)': 'ca-central-1',
     'Canada West (Calgary)': 'ca-west-1',
@@ -335,16 +318,6 @@ EC2_METRICS: dict = {
     'DiskWriteOps': {'stat': 'Average', 'unit': 'Count', 'ns': 'AWS/EC2'}
 }
 
-# S3 CloudWatch metrics to collect
-S3_METRICS: dict = {
-    'AllRequests': {'stat': 'Sum', 'unit': 'Count', 'ns': 'AWS/S3'},
-    'GetRequests': {'stat': 'Sum', 'unit': 'Count', 'ns': 'AWS/S3'},
-    'PutRequests': {'stat': 'Sum', 'unit': 'Count', 'ns': 'AWS/S3'},
-    'DeleteRequests': {'stat': 'Sum', 'unit': 'Count', 'ns': 'AWS/S3'},
-    'BytesDownloaded': {'stat': 'Sum', 'unit': 'Bytes', 'ns': 'AWS/S3'},
-    'BytesUploaded': {'stat': 'Sum', 'unit': 'Bytes', 'ns': 'AWS/S3'}
-}
-
 
 # =============================================================================
 # ACTIVITY DETECTION METRICS
@@ -362,12 +335,6 @@ EC2_ACTIVITY_METRICS: list = [
     'CPUUtilization',
     'NetworkIn',
     'NetworkOut'
-]
-
-S3_ACTIVITY_METRICS: list = [
-    'AllRequests',
-    'PutRequests',
-    'GetRequests'
 ]
 
 

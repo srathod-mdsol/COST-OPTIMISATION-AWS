@@ -1,3 +1,12 @@
+"""
+AWS Idle Identifier Dashboard
+
+This module provides the main Streamlit dashboard interface.
+For cached functions, import from ui.dashboard.cache instead.
+
+Backward compatibility is maintained - all exports are available here.
+"""
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -7,103 +16,46 @@ from typing import Dict, List, Optional, Any
 import traceback
 import re
 import os
-from functools import lru_cache
 
 from core.config import Config
 from core.logger import setup_logger
+from core.constants import HOURS_PER_MONTH, DAYS_PER_MONTH, DAYS_PER_YEAR, HOURS_PER_DAY
 from services.rds_manager import RDSManager
 from services.ec2_manager import EC2Manager
 from services.ebs_manager import EBSManager
-from services.s3_manager import S3Manager
 from etl.data_provider import ETLDataProvider
 from etl.pricing_loader import PricingLoader
 from etl.orchestrator import ETLOrchestrator
 from analysis.idle_analyzer import IdleAnalyzer
+from utils.auth import get_auth_manager
+
+# Import cached functions from the modular cache module
+# This reduces code duplication and centralizes caching logic
+from ui.dashboard.cache import (
+    get_ec2_detailed_breakdown_cached,
+    get_rds_detailed_breakdown_cached,
+    get_ebs_detailed_breakdown_cached,
+    get_etl_provider_cached,
+    get_instances_cached,
+    get_data_freshness_cached,
+    get_pricing_cached,
+    get_instance_tags_cached,
+    get_manager_cached,
+    load_css_cached,
+)
+
+# Import UI components for modular design
+from ui.dashboard.components import (
+    render_auth_section as _render_auth_section,
+    render_tags_display as _render_tags_display,
+    render_instance_selector as _render_instance_selector,
+    render_freshness_info as _render_freshness_info,
+    render_header as _render_header,
+    render_parameters as _render_parameters,
+    get_manager as _get_manager,
+)
 
 logger = setup_logger(__name__)
-
-
-# =============================================================================
-# CACHED FUNCTIONS FOR PERFORMANCE
-# =============================================================================
-
-@st.cache_resource
-def get_etl_provider_cached(env: str) -> ETLDataProvider:
-    """Get cached ETL provider instance - creates one per environment.
-    
-    Uses st.cache_resource to maintain a single instance per environment,
-    avoiding repeated database initialization.
-    """
-    db_path = Config.get_db_path(env)
-    return ETLDataProvider(db_path)
-
-
-@st.cache_data(ttl=60, show_spinner=False)
-def get_instances_cached(service_type: str, region: str, env: str) -> List[Dict]:
-    """Get cached instance list with 1-minute TTL.
-    
-    Reduces database queries for instance lists that don't change frequently.
-    """
-    provider = get_etl_provider_cached(env)
-    return provider.list_instances(service_type, region)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_data_freshness_cached(service_type: str, env: str) -> Optional[Dict]:
-    """Get cached data freshness with 5-minute TTL.
-    
-    Data freshness doesn't change frequently, so we cache it.
-    """
-    provider = get_etl_provider_cached(env)
-    return provider.get_data_freshness(service_type)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def get_pricing_cached(instance_type: str, region: str, service: str, env: str) -> Optional[float]:
-    """Get cached pricing with 1-hour TTL.
-    
-    Pricing data rarely changes, so we cache it for an hour.
-    """
-    provider = get_etl_provider_cached(env)
-    return provider.get_pricing(instance_type, region, service)
-
-
-@st.cache_data(ttl=300, show_spinner=False)
-def get_instance_tags_cached(instance_id: str, env: str) -> Dict[str, str]:
-    """Get cached instance tags with 5-minute TTL."""
-    provider = get_etl_provider_cached(env)
-    return provider.get_instance_tags(instance_id)
-
-
-@st.cache_resource
-def get_manager_cached(service_type: str, region: str, env: str):
-    """Get cached service manager instance.
-    
-    Uses st.cache_resource to maintain a single manager instance per configuration.
-    """
-    if service_type == 'RDS':
-        return RDSManager(region, use_etl=True, aws_environment=env)
-    elif service_type == 'EC2':
-        return EC2Manager(region, use_etl=True, aws_environment=env)
-    elif service_type == 'EBS':
-        return EBSManager(region, use_etl=True, aws_environment=env)
-    else:  # S3
-        return S3Manager(region, use_etl=True, aws_environment=env)
-
-
-@st.cache_data(ttl=3600, show_spinner=False)
-def load_css_cached() -> str:
-    """Load CSS from external file with caching.
-    
-    Reads the CSS file once and caches it for an hour.
-    """
-    css_path = os.path.join(os.path.dirname(__file__), 'styles.css')
-    try:
-        with open(css_path, 'r', encoding='utf-8') as f:
-            return f.read()
-    except FileNotFoundError:
-        logger.warning(f"CSS file not found at {css_path}, using inline fallback")
-        return ""
 
 
 class DashboardUI:
@@ -114,6 +66,9 @@ class DashboardUI:
         self._initialize_session_state()
         # Use cached provider instead of creating new one each time
         self._etl_provider = None
+        # Initialize data provider and database URL
+        self.data_provider = ETLDataProvider(db_path=self.config.ETL_DB_PATH, database_url=self.config.DATABASE_URL)
+        self.database_url = self.config.DATABASE_URL
 
     @property
     def etl_provider(self):
@@ -160,6 +115,138 @@ class DashboardUI:
             </style>
             """, unsafe_allow_html=True)
 
+    def _render_auth_section(self, auth) -> None:
+        """Render authentication section in sidebar.
+        
+        Shows login form for unauthenticated users, and user info/logout
+        for authenticated users. Also provides password change functionality.
+        
+        Args:
+            auth: AuthManager instance
+        """
+        # Check if admin users are configured
+        if not auth.has_users():
+            # No admin users configured - show info message
+            st.markdown('''
+            <div style="
+                background: rgba(255, 153, 0, 0.1); 
+                padding: 1rem; 
+                border-radius: 10px; 
+                border: 1px solid rgba(255, 153, 0, 0.3);
+                margin-bottom: 1rem;
+            ">
+                <p style="margin: 0; font-size: 0.85rem; color: #ff9900;">
+                    🔐 Admin features unlocked. Configure ADMIN_USERS in .env to enable authentication.
+                </p>
+            </div>
+            ''', unsafe_allow_html=True)
+            # Set admin access to True when no users configured
+            st.session_state['admin_authenticated'] = True
+            return
+        
+        # Update activity timestamp if authenticated
+        if auth.is_authenticated(st.session_state):
+            auth.update_activity(st.session_state)
+        
+        if auth.is_authenticated(st.session_state):
+            # Authenticated user info
+            username = auth.get_current_user(st.session_state)
+            remaining_time = auth.get_remaining_session_time(st.session_state)
+            
+            st.markdown('''
+            <div style="
+                background: rgba(0, 200, 83, 0.1); 
+                padding: 1rem; 
+                border-radius: 10px; 
+                border: 1px solid rgba(0, 200, 83, 0.3);
+                margin-bottom: 1rem;
+            ">
+                <h3 style="
+                    color: #00c853 !important; 
+                    font-size: 0.7rem !important; 
+                    text-transform: uppercase; 
+                    letter-spacing: 1.5px;
+                    font-weight: 600 !important;
+                    margin-bottom: 0.5rem;
+                ">🔐 Admin Session</h3>
+            </div>
+            ''', unsafe_allow_html=True)
+            
+            st.markdown(f"**User:** {username}")
+            if remaining_time is not None:
+                st.markdown(f"**Session:** {remaining_time} min remaining")
+            
+            # Password change section
+            with st.expander("🔑 Change Password"):
+                with st.form("password_change_form"):
+                    current_pwd = st.text_input("Current Password", type="password")
+                    new_pwd = st.text_input("New Password", type="password")
+                    confirm_pwd = st.text_input("Confirm New Password", type="password")
+                    submit = st.form_submit_button("Update Password", use_container_width=True)
+                    
+                    if submit:
+                        if not current_pwd or not new_pwd or not confirm_pwd:
+                            st.error("Please fill in all fields")
+                        elif new_pwd != confirm_pwd:
+                            st.error("New passwords do not match")
+                        elif len(new_pwd) < 8:
+                            st.error("Password must be at least 8 characters")
+                        else:
+                            success, message = auth.change_password(username, current_pwd, new_pwd)
+                            if success:
+                                st.success(message)
+                            else:
+                                st.error(message)
+            
+            # Logout button
+            if st.button("🚪 Logout", use_container_width=True, type="secondary"):
+                auth.logout(st.session_state)
+                st.rerun()
+            
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+        else:
+            # Login form
+            st.markdown('''
+            <div style="
+                background: rgba(255, 255, 255, 0.05); 
+                padding: 0.5rem; 
+                border-radius: 8px; 
+                border: 1px solid rgba(255, 255, 255, 0.1);
+                margin-bottom: 0.5rem;
+            ">
+                <h3 style="
+                    color: #ff9900 !important; 
+                    font-size: 0.7rem !important; 
+                    text-transform: uppercase; 
+                    letter-spacing: 1.5px;
+                    font-weight: 600 !important;
+                    margin-bottom: 0.5rem;
+                ">🔐 Admin Login</h3>
+            </div>
+            ''', unsafe_allow_html=True)
+            
+            with st.form("admin_login_form"):
+                username = st.text_input("Username")
+                password = st.text_input("Password", type="password")
+                submit = st.form_submit_button("Login", use_container_width=True, type="primary")
+                
+                if submit:
+                    if not username or not password:
+                        st.error("Please enter username and password")
+                    else:
+                        success, message = auth.authenticate(username, password)
+                        if success:
+                            auth.create_session(st.session_state, username)
+                            st.success("Login successful!")
+                            st.rerun()
+                        else:
+                            st.error(message)
+            
+            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+        
+        # Store authentication status for use in other methods
+        st.session_state['admin_authenticated'] = auth.is_authenticated(st.session_state)
+
     def render_sidebar(self, manager=None) -> tuple:
         """Render sidebar configuration with improved organization and accessibility"""
         with st.sidebar:
@@ -174,10 +261,10 @@ class DashboardUI:
             st.markdown('''
             <div style="
                 background: rgba(255,255,255,0.05); 
-                padding: 1rem; 
-                border-radius: 10px; 
+                padding: 0.5rem; 
+                border-radius: 8px; 
                 border: 1px solid rgba(255,255,255,0.1);
-                margin-bottom: 1rem;
+                margin-bottom: 0.5rem;
             ">
                 <h3 style="
                     color: #ff9900 !important; 
@@ -185,7 +272,7 @@ class DashboardUI:
                     text-transform: uppercase; 
                     letter-spacing: 1.5px;
                     font-weight: 600 !important;
-                    margin-bottom: 1rem;
+                    margin-bottom: 0.5rem;
                 ">☁️ AWS Environment</h3>
             </div>
             ''', unsafe_allow_html=True)
@@ -208,93 +295,14 @@ class DashboardUI:
                 st.session_state.instance_analysis_active = False
                 st.rerun()
 
-            # Data Management Section
-            st.markdown('''
-            <div style="
-                background: rgba(255,255,255,0.05); 
-                padding: 1rem; 
-                border-radius: 10px; 
-                border: 1px solid rgba(255,255,255,0.1);
-                margin-bottom: 1rem;
-            ">
-                <h3 style="
-                    color: #ff9900 !important; 
-                    font-size: 0.7rem !important; 
-                    text-transform: uppercase; 
-                    letter-spacing: 1.5px;
-                    font-weight: 600 !important;
-                    margin-bottom: 1rem;
-                ">📥 Data Management</h3>
-            </div>
-            ''', unsafe_allow_html=True)
-            
-            # Check ETL lock status for conditional UI
-            orchestrator = ETLOrchestrator(database_url=self.config.DATABASE_URL)
-            is_locked = orchestrator.is_etl_locked()
-            
-            # Show lock warning if ETL is locked
-            if is_locked:
-                st.warning("⚠️ ETL process is currently locked. A previous ETL run may have been interrupted.")
-                if st.button("🔓 Force Unlock ETL", 
-                             help="Release the ETL lock if a previous run was interrupted",
-                             use_container_width=True,
-                             type="secondary"):
-                    try:
-                        orchestrator.force_unlock()
-                        st.success("ETL lock released successfully!")
-                        st.rerun()
-                    except Exception as e:
-                        logger.error(f"Failed to release ETL lock: {e}", exc_info=True)
-                        st.error(f"Failed to release lock: {e}")
-                st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-            
-            # Add some spacing for buttons
-            col_etl1, col_etl2 = st.columns([1, 1])
-            with col_etl1:
-                if st.button("🔄 Refresh Data", 
-                             help="Fetches fresh data from AWS and reloads database",
-                             use_container_width=True,
-                             type="primary",
-                             disabled=is_locked):
-                    with st.spinner("Executing ETL process..."):
-                        try:
-                            self.etl_provider.truncate_and_reload(aws_environment=st.session_state.aws_environment)
-                            st.success("Data refreshed successfully!")
-                            st.rerun()
-                        except Exception as e:
-                            logger.error(f"ETL refresh failed: {e}", exc_info=True)
-                            st.error("ETL refresh failed. Check application logs.")
-            
-            with col_etl2:
-                if st.button("💲 Reload Pricing", 
-                             help="Update pricing cache from AWS",
-                             use_container_width=True,
-                             type="primary"):
-                    with st.spinner("Updating pricing cache..."):
-                        try:
-                            PricingLoader.run_etl(
-                                self.config.PRICING_DB_PATH,
-                                regions=['us-east-1'],  # Default region for pricing
-                                ec2_json_path=self.config.PRICING_JSON_PATHS['ec2'],
-                                rds_json_path=self.config.PRICING_JSON_PATHS['rds'],
-                                s3_json_path=self.config.PRICING_JSON_PATHS['s3']
-                            )
-                            st.success(f"Pricing updated!")
-                        except Exception as e:
-                            logger.error(f"Pricing ETL failed: {e}", exc_info=True)
-                            st.error("Pricing ETL failed. Check logs.")
-                            logger.error(f"Pricing ETL error: {e}")
-
-            st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-            
             # Service Selection with styled header
             st.markdown('''
             <div style="
                 background: rgba(255,255,255,0.05); 
-                padding: 1rem; 
-                border-radius: 10px; 
+                padding: 0.5rem; 
+                border-radius: 8px; 
                 border: 1px solid rgba(255,255,255,0.1);
-                margin-bottom: 1rem;
+                margin-bottom: 0.5rem;
             ">
                 <h3 style="
                     color: #ff9900 !important; 
@@ -302,17 +310,17 @@ class DashboardUI:
                     text-transform: uppercase; 
                     letter-spacing: 1.5px;
                     font-weight: 600 !important;
-                    margin-bottom: 1rem;
+                    margin-bottom: 0.5rem;
                 ">🖥️ Service Type</h3>
             </div>
             ''', unsafe_allow_html=True)
             
-            service_icons = {'RDS': '🗄️', 'EC2': '💻', 'EBS': '💾', 'S3': '🪣'}
-            service_type = st.segmented_control(
-                "Select AWS Service:",
-                options=['RDS', 'EC2', 'EBS', 'S3'],
-                default=st.session_state.selected_service,
-                format_func=lambda x: f"{service_icons.get(x, '')} {x}",
+            # Use simple radio buttons instead of segmented control for plain buttons
+            service_type = st.radio(
+                "Select Service",
+                options=['RDS', 'EC2'],
+                horizontal=True,
+                index=0 if st.session_state.selected_service == 'RDS' else (1 if st.session_state.selected_service == 'EC2' else 0),
                 key="service_selector"
             )
             
@@ -326,10 +334,10 @@ class DashboardUI:
             st.markdown('''
             <div style="
                 background: rgba(255,255,255,0.05); 
-                padding: 1rem; 
-                border-radius: 10px; 
+                padding: 0.5rem; 
+                border-radius: 8px; 
                 border: 1px solid rgba(255,255,255,0.1);
-                margin-bottom: 1rem;
+                margin-bottom: 0.5rem;
             ">
                 <h3 style="
                     color: #ff9900 !important; 
@@ -337,22 +345,35 @@ class DashboardUI:
                     text-transform: uppercase; 
                     letter-spacing: 1.5px;
                     font-weight: 600 !important;
-                    margin-bottom: 1rem;
+                    margin-bottom: 0.5rem;
                 ">🌍 Region</h3>
             </div>
             ''', unsafe_allow_html=True)
             
-            # Group regions by continent
-            region_groups = {
-                'Americas': ['us-east-1', 'us-east-2', 'us-west-1', 'us-west-2'],
-                'Europe': ['eu-west-1', 'eu-west-2', 'eu-central-1'],
-                'Asia Pacific': ['ap-south-1', 'ap-southeast-1', 'ap-southeast-2']
-            }
-            
-            all_regions = []
-            for group, regs in region_groups.items():
-                for r in regs:
-                    all_regions.append(r)
+            # Get regions from aws_regions table (cached discovered regions)
+            # Fall back to all available AWS regions if no data exists
+            try:
+                db_regions = self.data_provider.fetch_all(
+                    "SELECT region_name FROM aws_regions WHERE is_enabled = TRUE ORDER BY region_name"
+                )
+                if db_regions:
+                    all_regions = [r['region_name'] for r in db_regions]
+                else:
+                    # No cached regions yet - discover from AWS
+                    orchestrator = ETLOrchestrator(database_url=self.database_url)
+                    all_regions = orchestrator.get_all_aws_regions(st.session_state.get('aws_environment', 'Default'))
+            except Exception as e:
+                # Log the exception for debugging
+                logger.warning(f"Could not fetch regions from database: {e}")
+                # Discover from AWS using orchestrator (which has proper error handling)
+                try:
+                    orchestrator = ETLOrchestrator(database_url=self.database_url)
+                    all_regions = orchestrator.get_all_aws_regions(st.session_state.get('aws_environment', 'Default'))
+                except Exception as e2:
+                    logger.error(f"Could not discover regions from AWS: {e2}")
+                    # Final fallback to all known AWS regions from constants
+                    from core.constants import AWS_REGIONS
+                    all_regions = AWS_REGIONS
             
             region = st.selectbox(
                 "Select Region:",
@@ -368,10 +389,10 @@ class DashboardUI:
             st.markdown('''
             <div style="
                 background: rgba(255,255,255,0.05); 
-                padding: 1rem; 
-                border-radius: 10px; 
+                padding: 0.5rem; 
+                border-radius: 8px; 
                 border: 1px solid rgba(255,255,255,0.1);
-                margin-bottom: 1rem;
+                margin-bottom: 0.5rem;
             ">
                 <h3 style="
                     color: #ff9900 !important; 
@@ -379,7 +400,7 @@ class DashboardUI:
                     text-transform: uppercase; 
                     letter-spacing: 1.5px;
                     font-weight: 600 !important;
-                    margin-bottom: 1rem;
+                    margin-bottom: 0.5rem;
                 ">📊 Analysis Mode</h3>
             </div>
             ''', unsafe_allow_html=True)
@@ -404,10 +425,10 @@ class DashboardUI:
             st.markdown('''
             <div style="
                 background: rgba(255,255,255,0.05); 
-                padding: 1rem; 
-                border-radius: 10px; 
+                padding: 0.5rem; 
+                border-radius: 8px; 
                 border: 1px solid rgba(255,255,255,0.1);
-                margin-bottom: 1rem;
+                margin-bottom: 0.5rem;
             ">
                 <h3 style="
                     color: #ff9900 !important; 
@@ -415,7 +436,7 @@ class DashboardUI:
                     text-transform: uppercase; 
                     letter-spacing: 1.5px;
                     font-weight: 600 !important;
-                    margin-bottom: 1rem;
+                    margin-bottom: 0.5rem;
                 ">🎯 Actions</h3>
             </div>
             ''', unsafe_allow_html=True)
@@ -440,6 +461,112 @@ class DashboardUI:
 
             # Data Freshness Info
             self._render_freshness_info(service_type)
+            
+            # Authentication Section - at bottom
+            auth = get_auth_manager()
+            self._render_auth_section(auth)
+            
+            # Data Management Section - below Admin Login
+            st.markdown('''
+            <div style="
+                background: rgba(255,255,255,0.05); 
+                padding: 0.5rem; 
+                border-radius: 8px; 
+                border: 1px solid rgba(255,255,255,0.1);
+                margin-bottom: 0.5rem;
+            ">
+                <h3 style="
+                    color: #ff9900 !important; 
+                    font-size: 0.7rem !important; 
+                    text-transform: uppercase; 
+                    letter-spacing: 1.5px;
+                    font-weight: 600 !important;
+                    margin-bottom: 0.5rem;
+                ">📥 Data Management</h3>
+            </div>
+            ''', unsafe_allow_html=True)
+            
+            # Check authentication for admin actions
+            admin_authenticated = st.session_state.get('admin_authenticated', False)
+            
+            # Check ETL lock status for conditional UI
+            orchestrator = ETLOrchestrator(database_url=self.config.DATABASE_URL)
+            is_locked = orchestrator.is_etl_locked()
+            
+            # Show lock warning if ETL is locked (admin only)
+            if is_locked:
+                if admin_authenticated:
+                    st.warning("⚠️ ETL process is currently locked. A previous ETL run may have been interrupted.")
+                    if st.button("🔓 Force Unlock ETL", 
+                                 help="Release the ETL lock if a previous run was interrupted",
+                                 use_container_width=True,
+                                 type="secondary"):
+                        try:
+                            orchestrator.force_unlock()
+                            st.success("ETL lock released successfully!")
+                            st.rerun()
+                        except Exception as e:
+                            logger.error(f"Failed to release ETL lock: {e}", exc_info=True)
+                            st.error(f"Failed to release lock: {e}")
+                    st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
+                else:
+                    st.warning("⚠️ ETL process is locked. Login as admin to unlock.")
+            
+            # Admin-only buttons: Refresh Data and Reload Pricing
+            if admin_authenticated:
+                # Add some spacing for buttons
+                col_etl1, col_etl2 = st.columns([1, 1])
+                with col_etl1:
+                    if st.button("🔄 Refresh Data", 
+                                 help="Fetches fresh data from AWS and reloads database",
+                                 use_container_width=True,
+                                 type="primary",
+                                 disabled=is_locked):
+                        with st.spinner("Executing ETL process..."):
+                            try:
+                                self.etl_provider.truncate_and_reload(aws_environment=st.session_state.aws_environment)
+                                st.success("Data refreshed successfully!")
+                                # Clear Streamlit cache after data refresh
+                                st.cache_data.clear()
+                                st.rerun()
+                            except Exception as e:
+                                logger.error(f"ETL refresh failed: {e}", exc_info=True)
+                                st.error("ETL refresh failed. Check application logs.")
+                
+                with col_etl2:
+                    if st.button("💲 Reload Pricing", 
+                                 help="Update pricing cache from AWS",
+                                 use_container_width=True,
+                                 type="primary"):
+                        with st.spinner("Updating pricing cache..."):
+                            try:
+                                PricingLoader.run_etl(
+                                    self.config.PRICING_DB_PATH,
+                                    regions=['us-east-1'],  # Default region for pricing
+                                    ec2_json_path=self.config.PRICING_JSON_PATHS['ec2'],
+                                    rds_json_path=self.config.PRICING_JSON_PATHS['rds']
+                                )
+                                st.success(f"Pricing updated!")
+                            except Exception as e:
+                                logger.error(f"Pricing ETL failed: {e}", exc_info=True)
+                                st.error("Pricing ETL failed. Check logs.")
+                                logger.error(f"Pricing ETL error: {e}")
+            else:
+                # Show disabled buttons with lock icon for non-admin users
+                col_etl1, col_etl2 = st.columns([1, 1])
+                with col_etl1:
+                    st.button("🔄 Refresh Data", 
+                             help="Admin login required",
+                             use_container_width=True,
+                             type="secondary",
+                             disabled=True)
+                with col_etl2:
+                    st.button("💲 Reload Pricing", 
+                             help="Admin login required",
+                             use_container_width=True,
+                             type="secondary",
+                             disabled=True)
+                st.info("🔐 Login as admin to access data management features.")
             
             return manager, service_type, region, scan_button, analyze_button, selected_instance
 
@@ -489,9 +616,6 @@ class DashboardUI:
                 elif service_type == 'EBS':
                     instances = manager.list_instances()
                     ids = [f"{i['volume_id']} ({i.get('name', 'N/A')})" for i in instances]
-                else:  # S3
-                    instances = manager.list_instances()
-                    ids = [i['name'] for i in instances]
 
                 if not ids:
                     st.warning(f"⚠️ No {service_type} resources found")
@@ -769,7 +893,7 @@ class DashboardUI:
                 "CloudWatch Lookback", 
                 min_value=1, 
                 max_value=2160, 
-                value=24,
+                value=2160,
                 help="How far back to look for CloudWatch metrics (in hours). Higher values = more historical data but slower queries."
             )
             st.caption(f"📊 Viewing {cw_hours // 24} day(s) of metrics")
@@ -794,10 +918,95 @@ class DashboardUI:
             )
             st.caption(f"🎯 Threshold: {threshold}+")
         
-        return cw_hours, act_days, threshold
+        # Pricing Model Settings Section
+        st.markdown('''
+        <div style="
+            background: #ffffff; 
+            border: 1px solid #dfe3e8; 
+            border-radius: 10px; 
+            padding: 1.5rem; 
+            margin: 1rem 0 2rem 0;
+        ">
+            <h3 style="
+                color: #232f3e; 
+                font-size: 1.1rem; 
+                margin: 0 0 1.5rem 0;
+                padding-bottom: 0.75rem;
+                border-bottom: 2px solid #ff9900;
+            ">💰 Pricing Model Settings</h3>
+        </div>
+        ''', unsafe_allow_html=True)
+        
+        # Pricing model selection
+        pricing_col1, pricing_col2, pricing_col3 = st.columns(3)
+        
+        with pricing_col1:
+            pricing_model = st.selectbox(
+                "Pricing Model",
+                options=["On-Demand", "Reserved Instances", "Savings Plans"],
+                index=0,
+                help="Select your pricing model to calculate accurate potential savings."
+            )
+        
+        # Initialize pricing settings dictionary
+        pricing_settings = {
+            'pricing_model': pricing_model,
+            'ri_coverage': 0,
+            'sp_coverage': 0,
+            'use_actual_runtime': False,
+            'actual_hours': None
+        }
+        
+        if pricing_model == "Reserved Instances":
+            with pricing_col2:
+                ri_coverage = st.slider(
+                    "RI Coverage", 
+                    min_value=0, 
+                    max_value=100, 
+                    value=0,
+                    help="Percentage of instances covered by Reserved Instances (0-100%). This reduces the calculated savings."
+                )
+                pricing_settings['ri_coverage'] = ri_coverage / 100.0
+            st.caption(f"🔒 {ri_coverage}% covered by RI")
+        elif pricing_model == "Savings Plans":
+            with pricing_col2:
+                sp_coverage = st.slider(
+                    "Savings Plans Coverage", 
+                    min_value=0, 
+                    max_value=100, 
+                    value=0,
+                    help="Percentage of instances covered by Savings Plans (0-100%). This reduces the calculated savings."
+                )
+                pricing_settings['sp_coverage'] = sp_coverage / 100.0
+            st.caption(f"💎 {sp_coverage}% covered by Savings Plans")
+        
+        with pricing_col3:
+            use_actual_runtime = st.checkbox(
+                "Use Actual Runtime",
+                value=False,
+                help="Use actual instance runtime hours instead of fixed 730 hours/month for more accurate savings."
+            )
+            pricing_settings['use_actual_runtime'] = use_actual_runtime
+        
+        if use_actual_runtime:
+            st.caption("📈 Using actual runtime hours for cost calculation")
+        else:
+            st.caption("📅 Using fixed 730 hours/month (average)")
+        
+        return cw_hours, act_days, threshold, pricing_settings
 
-    def display_single_analysis(self, manager, service_type, instance_id, cloudwatch_hours, activity_days):
+    def display_single_analysis(self, manager, service_type, instance_id, cloudwatch_hours, activity_days, pricing_settings=None):
         """Display single instance analysis with improved visual hierarchy"""
+        
+        # Default pricing settings if not provided
+        if pricing_settings is None:
+            pricing_settings = {
+                'pricing_model': 'On-Demand',
+                'ri_coverage': 0,
+                'sp_coverage': 0,
+                'use_actual_runtime': False,
+                'actual_hours': None
+            }
         
         with st.spinner(f"🔍 Analyzing {instance_id}..."):
             try:
@@ -817,9 +1026,6 @@ class DashboardUI:
                 elif service_type == 'EBS':
                     instances = manager.list_instances()
                     instance_info = next((i for i in instances if i.get('volume_id') == instance_id), None)
-                else:  # S3
-                    instances = manager.list_instances()
-                    instance_info = next((i for i in instances if i.get('name') == instance_id), None)
 
                 if not instance_info:
                     st.error("Resource information not found")
@@ -832,8 +1038,6 @@ class DashboardUI:
                     analysis = IdleAnalyzer.analyze_ec2(metrics, last_activity, activity_days)
                 elif service_type == 'EBS':
                     analysis = IdleAnalyzer.analyze_ebs(metrics, last_activity, activity_days)
-                else:
-                    analysis = IdleAnalyzer.analyze_s3(metrics, last_activity, instance_info, activity_days)
 
                 # Header
                 st.markdown(f'## 🔍 {service_type} Analysis: {instance_info.get("instance_id", instance_info.get("name"))}')
@@ -849,23 +1053,19 @@ class DashboardUI:
                 
                 with metric_col1:
                     if service_type == 'RDS':
+                        st.metric("Instance Identifier", instance_info.get('instance_id', instance_info.get('db_instance_identifier', 'N/A')))
                         st.metric("Instance Class", instance_info.get('instance_class', 'N/A'))
                         st.metric("Engine", instance_info.get('engine', 'N/A'))
                     elif service_type == 'EC2':
+                        st.metric("Instance ID", instance_info.get('instance_id', 'N/A'))
                         st.metric("Instance Type", instance_info.get('instance_type', 'N/A'))
                         st.metric("Platform", instance_info.get('platform', 'N/A'))
                     elif service_type == 'EBS':
                         st.metric("Volume Type", instance_info.get('volume_type', 'N/A'))
                         st.metric("Size", f"{instance_info.get('size_gb', 0)} GB")
-                    else:  # S3
-                        st.metric("Bucket Name", instance_info.get('name', 'N/A'))
-                        st.metric("Region", instance_info.get('region', 'N/A'))
                 
                 with metric_col2:
-                    if service_type == 'S3':
-                        st.metric("Size", f"{instance_info.get('size_gb', 0):.4f} GB")
-                        st.metric("Objects", f"{instance_info.get('object_count', 0):,}")
-                    elif service_type == 'EBS':
+                    if service_type == 'EBS':
                         st.metric("Attached To", instance_info.get('attached_instance_id', 'Unattached'))
                         st.metric("Status", instance_info.get('status', 'unknown'))
                     else:
@@ -908,35 +1108,81 @@ class DashboardUI:
                 # Cost Savings Section
                 if severity in ['CRITICAL', 'HIGH', 'MEDIUM']:
                     st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-                    st.markdown('### 💰 Potential Cost Savings')
+                    st.markdown('### 💰 Potential Cost Savings (Considering only Idle Instances)')
                     region = instance_info.get('region', 'us-east-1')
+                    
+                    # Get actual hours based on pricing settings
+                    if pricing_settings.get('use_actual_runtime', False):
+                        try:
+                            from analysis.cost_calculator import CostCalculator
+                            actual_hours = CostCalculator.get_actual_runtime_hours(instance_id)
+                        except:
+                            actual_hours = HOURS_PER_MONTH
+                    else:
+                        actual_hours = HOURS_PER_MONTH
+                    
+                    # Calculate discount factor based on pricing model
+                    ri_coverage = pricing_settings.get('ri_coverage', 0)
+                    sp_coverage = pricing_settings.get('sp_coverage', 0)
+                    discount_factor = 1.0 - max(ri_coverage, sp_coverage)
                     
                     if service_type == 'RDS':
                         sku = instance_info.get('instance_class', '').replace('db.', '')
-                        hourly_cost = self.etl_provider.get_pricing(sku, region, service='RDS')
+                        # Pass additional parameters for accurate pricing
+                        database_engine = instance_info.get('engine', '')
+                        deployment_option = 'Multi-AZ' if instance_info.get('multi_az') in [True, 'true', 'True', 'yes', 'Yes'] else 'Single-AZ'
+                        license_model = instance_info.get('license_model', '')
+                        hourly_cost = self.etl_provider.get_pricing(
+                            sku, region, service='RDS',
+                            database_engine=database_engine,
+                            deployment_option=deployment_option,
+                            license_model=license_model
+                        )
                         if not hourly_cost:
-                            st.warning(f"Pricing data not available for {sku} in {region}")
+                            st.warning(f"Pricing data not available for {sku} ({database_engine}) in {region}")
                             return
-                        monthly_savings = hourly_cost * 730
+                        
+                        # Add RDS storage costs - use RDS-specific pricing (DIFFERENT from EBS!)
+                        from analysis.cost_calculator import CostCalculator
+                        storage_type = instance_info.get('storage_type', 'gp2')
+                        allocated_storage = instance_info.get('allocated_storage', 0)
+                        iops = instance_info.get('iops', 0)
+                        multi_az = instance_info.get('multi_az', False)
+                        
+                        if allocated_storage and allocated_storage > 0:
+                            storage_cost = CostCalculator.calculate_rds_storage_cost(
+                                int(allocated_storage), storage_type, 
+                                iops=int(iops) if iops else None,
+                                multi_az=multi_az,
+                                region=region
+                            )
+                            monthly_storage_cost = storage_cost.get('monthly', 0)
+                            # Also get IOPS monthly cost if applicable
+                            iops_monthly_cost = storage_cost.get('iops_monthly', 0)
+                        else:
+                            monthly_storage_cost = 0
+                            iops_monthly_cost = 0
+                        
+                        # Apply discount factor and use actual hours
+                        monthly_savings = ((hourly_cost * actual_hours) + monthly_storage_cost + iops_monthly_cost) * discount_factor
                     elif service_type == 'EC2':
                         sku = instance_info.get('instance_type', '')
-                        hourly_cost = self.etl_provider.get_pricing(sku, region, service='EC2')
+                        # Pass additional parameters for accurate pricing
+                        operating_system = instance_info.get('platform', 'Linux/UNIX')
+                        tenancy = instance_info.get('tenancy', 'shared')
+                        hourly_cost = self.etl_provider.get_pricing(
+                            sku, region, service='EC2',
+                            operating_system=operating_system,
+                            tenancy=tenancy
+                        )
                         if not hourly_cost:
-                            st.warning(f"Pricing data not available for {sku} in {region}")
+                            st.warning(f"Pricing data not available for {sku} ({operating_system}) in {region}")
                             return
-                        monthly_savings = hourly_cost * 730
+                        # Apply discount factor and use actual hours
+                        monthly_savings = (hourly_cost * actual_hours) * discount_factor
                     elif service_type == 'EBS':
-                        monthly_savings = instance_info.get('monthly_cost', 0)
-                        hourly_cost = monthly_savings / 730
-                    else:  # S3
-                        size_gb = instance_info.get('size_gb', 0)
-                        storage_class = instance_info.get('storage_class', 'StandardStorage')
-                        cost_per_gb = self.etl_provider.get_pricing(storage_class, region, service='S3')
-                        if not cost_per_gb:
-                            st.warning(f"S3 pricing data not available for {storage_class} in {region}")
-                            return
-                        monthly_savings = size_gb * cost_per_gb
-                        hourly_cost = monthly_savings / 730
+                        monthly_savings = instance_info.get('monthly_cost', 0) * discount_factor
+                        hourly_cost = monthly_savings / actual_hours if actual_hours > 0 else 0
                     
                     savings_col1, savings_col2, savings_col3 = st.columns(3)
                     with savings_col1:
@@ -944,14 +1190,283 @@ class DashboardUI:
                     with savings_col2:
                         # Include EBS in savings for EC2 if applicable
                         if service_type == 'EC2' and attached_volumes:
-                            total_ebs_cost = sum(v.get('monthly_cost', 0) for v in attached_volumes)
+                            total_ebs_cost = sum(v.get('monthly_cost', 0) for v in attached_volumes) * discount_factor
                             total_monthly = monthly_savings + total_ebs_cost
-                            st.metric("Monthly Savings", f"${total_monthly:.2f}", delta=f"Incls. ${total_ebs_cost:.2f} EBS")
+                            st.metric("Monthly Savings", f"${total_monthly:.2f}", delta=f"Incl. ${total_ebs_cost:.2f} EBS")
                             monthly_savings = total_monthly # For annual calculation
                         else:
                             st.metric("Monthly Savings", f"${monthly_savings:.2f}")
                     with savings_col3:
                         st.metric("Annual Savings", f"${monthly_savings * 12:.2f}")
+                    
+                    # Show pricing model info if not On-Demand
+                    pricing_model = pricing_settings.get('pricing_model', 'On-Demand')
+                    if pricing_model != 'On-Demand':
+                        coverage = int(max(ri_coverage, sp_coverage) * 100)
+                        st.caption(f"📊 {pricing_model} coverage applied: {coverage}% discount")
+
+                    # =============================================================
+                    # ITEMIZED COST BREAKDOWN SECTION
+                    # =============================================================
+                    
+                    # Get environment for ETL provider calls
+                    env = st.session_state.get('aws_environment', 'Default')
+                    
+                    with st.expander("📋 View Detailed Cost Breakdown", expanded=False):
+                        if service_type == 'EC2':
+                            # EC2 Detailed Cost Breakdown
+                            st.markdown("### 💻 EC2 Instance Cost Breakdown")
+                            
+                            # Get detailed cost breakdown using cached function
+                            try:
+                                import json
+                                # Build EBS volumes list from attached_volumes for cost calculation
+                                ebs_volumes_for_calc = []
+                                if attached_volumes:
+                                    for vol in attached_volumes:
+                                        ebs_volumes_for_calc.append({
+                                            'volume_id': vol.get('volume_id', 'unknown'),
+                                            'size_gb': vol.get('size_gb', 0),
+                                            'volume_type': vol.get('volume_type', 'gp2'),
+                                            'iops': vol.get('iops', 0),
+                                            'throughput': vol.get('throughput_mbps', 0)
+                                        })
+                                
+                                ebs_volumes_json = json.dumps(ebs_volumes_for_calc) if ebs_volumes_for_calc else '[]'
+                                detailed_cost = get_ec2_detailed_breakdown_cached(
+                                    instance_type=sku,
+                                    region=region,
+                                    operating_system=operating_system,
+                                    tenancy=tenancy,
+                                    hourly_price=hourly_cost,
+                                    env=env,
+                                    ebs_volumes_json=ebs_volumes_json
+                                )
+                                
+                                # Display Compute Costs
+                                compute = detailed_cost.get('compute', {})
+                                st.markdown("**COMPUTE COSTS**")
+                                col1, col2, col3, col4 = st.columns(4)
+                                with col1:
+                                    st.metric("Instance Type", detailed_cost.get('instance_type', sku))
+                                with col2:
+                                    st.metric("Operating System", operating_system)
+                                with col3:
+                                    st.metric("Unit Price", f"${compute.get('unit_price', 0):.4f}/hr")
+                                with col4:
+                                    st.metric("Hours/Month", f"{compute.get('hours', HOURS_PER_MONTH)}")
+                                
+                                st.markdown(f"""
+                                <div style="background: rgba(0,100,0,0.1); padding: 10px; border-radius: 5px; margin: 10px 0;">
+                                    <strong>Compute Subtotal:</strong> ${compute.get('monthly', 0):.2f}/month
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Display Storage Costs
+                                storage = detailed_cost.get('storage', {})
+                                volumes = storage.get('volumes', [])
+                                if volumes:
+                                    st.markdown("**STORAGE COSTS (EBS)**")
+                                    for vol in volumes:
+                                        st.markdown(f"""
+                                        <div style="background: rgba(255,150,0,0.1); padding: 10px; border-radius: 5px; border-left: 3px solid #ff9900; margin: 5px 0;">
+                                            <strong>Volume: {vol.get('volume_id', 'unknown')}</strong><br/>
+                                            <small>Type: {vol.get('volume_type')} | Size: {vol.get('size_gb')} GB</small><br/>
+                                            Storage: ${vol.get('storage_monthly', 0):.2f}/mo | IOPS: ${vol.get('iops_monthly', 0):.2f}/mo<br/>
+                                            <strong>Total: ${vol.get('total_monthly', 0):.2f}/mo</strong>
+                                        </div>
+                                        """, unsafe_allow_html=True)
+                                    
+                                    st.markdown(f"""
+                                    <div style="background: rgba(0,100,0,0.1); padding: 10px; border-radius: 5px; margin: 10px 0;">
+                                        <strong>Storage Subtotal:</strong> ${storage.get('monthly', 0):.2f}/month
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                # Display Data Transfer
+                                data_transfer = detailed_cost.get('data_transfer', {})
+                                if data_transfer.get('gb_out', 0) > 0 or data_transfer.get('gb_in', 0) > 0:
+                                    st.markdown("**DATA TRANSFER**")
+                                    st.markdown(f"""
+                                    <div style="background: rgba(0,0,100,0.1); padding: 10px; border-radius: 5px; margin: 10px 0;">
+                                        Transfer OUT: {data_transfer.get('gb_out', 0)} GB @ ${data_transfer.get('rate_out', 0):.2f}/GB = ${data_transfer.get('cost_out', 0):.2f}<br/>
+                                        <strong>Transfer Subtotal:</strong> ${data_transfer.get('monthly', 0):.2f}/month
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                # Total
+                                st.markdown(f"""
+                                <div style="background: rgba(0,150,0,0.2); padding: 15px; border-radius: 5px; margin: 15px 0; border: 2px solid #00aa00;">
+                                    <strong style="font-size: 1.2em;">TOTAL MONTHLY COST: ${detailed_cost.get('monthly', 0):.2f}</strong><br/>
+                                    <strong style="font-size: 1.2em;">TOTAL ANNUAL COST: ${detailed_cost.get('annual', 0):.2f}</strong>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                            except Exception as e:
+                                st.warning(f"Could not generate detailed breakdown: {e}")
+                                
+                        elif service_type == 'RDS':
+                            # RDS Detailed Cost Breakdown
+                            st.markdown("### 🗄️ RDS Instance Cost Breakdown")
+                            
+                            try:
+                                detailed_cost = get_rds_detailed_breakdown_cached(
+                                    instance_type=sku,
+                                    region=region,
+                                    database_engine=database_engine,
+                                    license_model=license_model,
+                                    deployment_option=deployment_option,
+                                    instance_hourly_price=hourly_cost,
+                                    allocated_storage=allocated_storage,
+                                    storage_type=storage_type,
+                                    iops=int(iops) if iops else 0,
+                                    multi_az=multi_az,
+                                    env=env,
+                                    backup_storage_gb=instance_info.get('backup_storage_gb', 0),
+                                    backup_retention_days=instance_info.get('backup_retention_days', 7)
+                                )
+                                
+                                # Display Compute Costs
+                                compute = detailed_cost.get('compute', {})
+                                st.markdown("**COMPUTE COSTS**")
+                                col1, col2 = st.columns(2)
+                                with col1:
+                                    st.metric("Instance Type", detailed_cost.get('instance_type', sku))
+                                with col2:
+                                    st.metric("Database Engine", detailed_cost.get('database_engine', database_engine))
+                                
+                                col3, col4 = st.columns(2)
+                                with col3:
+                                    st.metric("Deployment", detailed_cost.get('deployment_option', deployment_option))
+                                with col4:
+                                    st.metric("Unit Price", f"${compute.get('unit_price', 0):.4f}/hr")
+                                
+                                st.markdown(f"""
+                                <div style="background: rgba(0,100,0,0.1); padding: 10px; border-radius: 5px; margin: 10px 0;">
+                                    <strong>Compute Subtotal:</strong> ${compute.get('monthly', 0):.2f}/month
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Display Storage Costs
+                                storage = detailed_cost.get('storage', {})
+                                st.markdown("**STORAGE COSTS**")
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("Storage Type", storage.get('storage_type', storage_type))
+                                with col2:
+                                    st.metric("Allocated", f"{storage.get('allocated_storage_gb', 0)} GB")
+                                with col3:
+                                    st.metric("Multi-AZ Factor", f"{storage.get('multi_az_factor', 1)}x")
+                                
+                                st.markdown(f"""
+                                <div style="background: rgba(255,150,0,0.1); padding: 10px; border-radius: 5px; border-left: 3px solid #ff9900; margin: 10px 0;">
+                                    Effective Storage: {storage.get('effective_storage_gb', 0)} GB @ ${storage.get('rate_per_gb', 0):.3f}/GB/mo<br/>
+                                    <strong>Storage Subtotal:</strong> ${storage.get('monthly', 0):.2f}/month
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Display IOPS Costs
+                                iops_data = detailed_cost.get('iops', {})
+                                if iops_data.get('provisioned'):
+                                    st.markdown("**IOPS COSTS**")
+                                    st.markdown(f"""
+                                    <div style="background: rgba(100,100,0,0.1); padding: 10px; border-radius: 5px; margin: 10px 0;">
+                                        Provisioned: {iops_data.get('provisioned', 0)} IOPS<br/>
+                                        Base Included: {iops_data.get('base_included', 0)} IOPS<br/>
+                                        Extra IOPS: {iops_data.get('extra_iops', 0)} @ ${iops_data.get('rate_per_iops', 0):.4f}/IOPS/mo<br/>
+                                        <strong>IOPS Subtotal:</strong> ${iops_data.get('monthly', 0):.2f}/month
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                # Display Backup Storage Costs
+                                backup_data = detailed_cost.get('backup', {})
+                                if backup_data.get('storage_gb', 0) > 0:
+                                    st.markdown("**BACKUP STORAGE COSTS**")
+                                    st.markdown(f"""
+                                    <div style="background: rgba(0,100,150,0.1); padding: 10px; border-radius: 5px; margin: 10px 0;">
+                                        Backup Storage: {backup_data.get('storage_gb', 0)} GB<br/>
+                                        Retention: {backup_data.get('retention_days', 7)} days<br/>
+                                        Rate: ${backup_data.get('rate_per_gb', 0):.3f}/GB/mo<br/>
+                                        <strong>Backup Subtotal:</strong> ${backup_data.get('monthly', 0):.2f}/month
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                # Total
+                                st.markdown(f"""
+                                <div style="background: rgba(0,150,0,0.2); padding: 15px; border-radius: 5px; margin: 15px 0; border: 2px solid #00aa00;">
+                                    <strong style="font-size: 1.2em;">TOTAL MONTHLY COST: ${detailed_cost.get('monthly', 0):.2f}</strong><br/>
+                                    <strong style="font-size: 1.2em;">TOTAL ANNUAL COST: ${detailed_cost.get('annual', 0):.2f}</strong>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                            except Exception as e:
+                                st.warning(f"Could not generate detailed breakdown: {e}")
+                                
+                        elif service_type == 'EBS':
+                            # EBS Detailed Cost Breakdown
+                            st.markdown("### 💿 EBS Volume Cost Breakdown")
+                            
+                            try:
+                                vol_size = instance_info.get('size_gb', 0)
+                                vol_type = instance_info.get('volume_type', 'gp2')
+                                vol_iops = instance_info.get('iops')
+                                vol_throughput = instance_info.get('throughput_mbps')
+                                
+                                detailed_cost = get_ebs_detailed_breakdown_cached(
+                                    volume_id=instance_info.get('volume_id', 'unknown'),
+                                    size_gb=vol_size,
+                                    volume_type=vol_type,
+                                    region=region,
+                                    iops=vol_iops if vol_iops else 0,
+                                    throughput_mbps=vol_throughput if vol_throughput else 0,
+                                    env=env
+                                )
+                                
+                                # Display Storage Cost
+                                col1, col2, col3 = st.columns(3)
+                                with col1:
+                                    st.metric("Volume Type", detailed_cost.get('volume_type', vol_type))
+                                with col2:
+                                    st.metric("Size", f"{detailed_cost.get('size_gb', vol_size)} GB")
+                                with col3:
+                                    st.metric("Storage Rate", f"${detailed_cost.get('storage_rate', 0):.3f}/GB/mo")
+                                
+                                st.markdown(f"""
+                                <div style="background: rgba(255,150,0,0.1); padding: 10px; border-radius: 5px; border-left: 3px solid #ff9900; margin: 10px 0;">
+                                    <strong>Storage Cost:</strong> ${detailed_cost.get('storage_monthly', 0):.2f}/month
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                                # Display IOPS Cost if applicable
+                                if detailed_cost.get('iops_provisioned'):
+                                    st.markdown(f"""
+                                    <div style="background: rgba(100,100,0,0.1); padding: 10px; border-radius: 5px; margin: 10px 0;">
+                                        Provisioned IOPS: {detailed_cost.get('iops_provisioned', 0)}<br/>
+                                        Extra IOPS: {detailed_cost.get('iops_extra', 0)} @ ${detailed_cost.get('iops_rate', 0):.4f}/IOPS/mo<br/>
+                                        <strong>IOPS Cost:</strong> ${detailed_cost.get('iops_monthly', 0):.2f}/month
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                # Display Throughput Cost if applicable
+                                if detailed_cost.get('throughput_provisioned'):
+                                    st.markdown(f"""
+                                    <div style="background: rgba(0,100,100,0.1); padding: 10px; border-radius: 5px; margin: 10px 0;">
+                                        Provisioned Throughput: {detailed_cost.get('throughput_provisioned', 0)} MB/s<br/>
+                                        Extra Throughput: {detailed_cost.get('throughput_extra', 0)} MB/s @ ${detailed_cost.get('throughput_rate', 0):.2f}/MB/s/mo<br/>
+                                        <strong>Throughput Cost:</strong> ${detailed_cost.get('throughput_monthly', 0):.2f}/month
+                                    </div>
+                                    """, unsafe_allow_html=True)
+                                
+                                # Total
+                                st.markdown(f"""
+                                <div style="background: rgba(0,150,0,0.2); padding: 15px; border-radius: 5px; margin: 15px 0; border: 2px solid #00aa00;">
+                                    <strong style="font-size: 1.2em;">TOTAL MONTHLY COST: ${detailed_cost.get('monthly', 0):.2f}</strong><br/>
+                                    <strong style="font-size: 1.2em;">TOTAL ANNUAL COST: ${detailed_cost.get('annual', 0):.2f}</strong>
+                                </div>
+                                """, unsafe_allow_html=True)
+                                
+                            except Exception as e:
+                                st.warning(f"Could not generate detailed breakdown: {e}")
 
                 # Attached EBS Volumes Section (for EC2)
                 if service_type == 'EC2' and attached_volumes:
@@ -1554,7 +2069,7 @@ class DashboardUI:
             instances = manager.list_instances()
             
             if not instances:
-                st.warning(f"⚠️ No {service_type} {'instances' if service_type != 'S3' else 'buckets'} found in the selected region")
+                st.warning(f"⚠️ No {service_type} instances found in the selected region")
                 st.markdown("""
                 **Tips:**
                 - Try selecting a different region
@@ -1571,9 +2086,7 @@ class DashboardUI:
             # Extract instance IDs
             instance_ids = []
             for instance in instances:
-                if service_type == 'S3':
-                    instance_ids.append(instance['name'])
-                elif service_type == 'EBS':
+                if service_type == 'EBS':
                     instance_ids.append(instance['volume_id'])
                 else:
                     instance_ids.append(instance['instance_id'])
@@ -1609,9 +2122,7 @@ class DashboardUI:
             status_text.info(f"⚡ Analyzing {len(instances)} instances...")
             
             for idx, instance in enumerate(instances):
-                if service_type == 'S3':
-                    instance_id = instance['name']  # Bucket name
-                elif service_type == 'EBS':
+                if service_type == 'EBS':
                     instance_id = instance['volume_id']
                 else:
                     instance_id = instance['instance_id']
@@ -1634,8 +2145,6 @@ class DashboardUI:
                         analysis = IdleAnalyzer.analyze_ec2(metrics, last_activity, activity_days)
                     elif service_type == 'EBS':
                         analysis = IdleAnalyzer.analyze_ebs(metrics, last_activity, activity_days)
-                    else:  # S3
-                        analysis = IdleAnalyzer.analyze_s3(metrics, last_activity, instance, activity_days)
                     
                     days_idle = last_activity.get('days_since_activity')
                     
@@ -1689,8 +2198,18 @@ class DashboardUI:
             avg_time = duration / len(results) if results else 0
             st.success(f"✅ Scan complete! Analyzed {len(results)} resources in {duration:.1f} seconds ({avg_time:.2f}s avg). Found {idle_count} idle resources.")
 
-    def display_scan_results(self, service_type):
+    def display_scan_results(self, service_type, pricing_settings=None):
         """Display scan results with improved visual hierarchy"""
+        
+        # Default pricing settings if not provided
+        if pricing_settings is None:
+            pricing_settings = {
+                'pricing_model': 'On-Demand',
+                'ri_coverage': 0,
+                'sp_coverage': 0,
+                'use_actual_runtime': False,
+                'actual_hours': None
+            }
         results = st.session_state.scan_results
         if not results:
             return
@@ -1735,7 +2254,13 @@ class DashboardUI:
         # Cost savings section
         if idle_count > 0:
             st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
-            st.markdown('### 💰 Potential Cost Savings')
+            st.markdown('### 💰 Potential Cost Savings (Considering only Idle Instances)')
+            
+            # Get pricing model settings
+            ri_coverage = pricing_settings.get('ri_coverage', 0)
+            sp_coverage = pricing_settings.get('sp_coverage', 0)
+            discount_factor = 1.0 - max(ri_coverage, sp_coverage)
+            use_actual_runtime = pricing_settings.get('use_actual_runtime', False)
             
             total_monthly_savings = 0
             pricing_unavailable = 0
@@ -1743,33 +2268,78 @@ class DashboardUI:
             
             for r in results:
                 if r.get('status') == 'idle':
+                    # Get actual hours for this instance if enabled
+                    if use_actual_runtime:
+                        try:
+                            from analysis.cost_calculator import CostCalculator
+                            instance_id = r['instance'].get('instance_id') or r['instance'].get('db_instance_identifier')
+                            actual_hours = CostCalculator.get_actual_runtime_hours(instance_id)
+                        except:
+                            actual_hours = HOURS_PER_MONTH
+                    else:
+                        actual_hours = HOURS_PER_MONTH
+                    
                     if service_type == 'RDS':
                         instance_class = r['instance']['instance_class'].replace('db.', '')
                         region = r['instance'].get('region', 'us-east-1')
-                        hourly_cost = get_pricing_cached(instance_class, region, 'RDS', env)
+                        database_engine = r['instance'].get('engine', '')
+                        deployment_option = 'Multi-AZ' if r['instance'].get('multi_az') in [True, 'true', 'True', 'yes', 'Yes'] else 'Single-AZ'
+                        hourly_cost = get_pricing_cached(
+                            instance_class, region, 'RDS', env,
+                            database_engine=database_engine,
+                            deployment_option=deployment_option
+                        )
                         if hourly_cost:
-                            total_monthly_savings += hourly_cost * 730
+                            # Add RDS storage costs - use RDS-specific pricing (DIFFERENT from EBS!)
+                            from analysis.cost_calculator import CostCalculator
+                            storage_type = r['instance'].get('storage_type', 'gp2')
+                            allocated_storage = r['instance'].get('allocated_storage', 0)
+                            iops = r['instance'].get('iops', 0)
+                            multi_az = r['instance'].get('multi_az', False)
+                            
+                            if allocated_storage and allocated_storage > 0:
+                                storage_cost = CostCalculator.calculate_rds_storage_cost(
+                                    int(allocated_storage), storage_type,
+                                    iops=int(iops) if iops else None,
+                                    multi_az=multi_az,
+                                    region=region
+                                )
+                                monthly_storage = storage_cost.get('monthly', 0)
+                                # Also get IOPS monthly cost if applicable
+                                iops_monthly = storage_cost.get('iops_monthly', 0)
+                            else:
+                                monthly_storage = 0
+                                iops_monthly = 0
+                            
+                            # Apply discount factor and use actual hours
+                            instance_savings = ((hourly_cost * actual_hours) + monthly_storage + iops_monthly) * discount_factor
+                            total_monthly_savings += instance_savings
                         else:
                             pricing_unavailable += 1
                     elif service_type == 'EC2':
                         instance_type = r['instance']['instance_type']
                         region = r['instance'].get('region', 'us-east-1')
-                        hourly_cost = get_pricing_cached(instance_type, region, 'EC2', env)
+                        operating_system = r['instance'].get('platform', 'Linux/UNIX')
+                        tenancy = r['instance'].get('tenancy', 'shared')
+                        hourly_cost = get_pricing_cached(
+                            instance_type, region, 'EC2', env,
+                            operating_system=operating_system,
+                            tenancy=tenancy
+                        )
                         if hourly_cost:
-                            total_monthly_savings += hourly_cost * 730
+                            # Calculate EC2 compute cost with actual hours
+                            ec2_monthly = (hourly_cost * actual_hours) * discount_factor
+                            
+                            # Add attached EBS volumes cost (CRITICAL - was missing!)
+                            extra_info = r.get('extra_info', {})
+                            attached_volumes = extra_info.get('attached_volumes', [])
+                            ebs_monthly = sum(v.get('monthly_cost', 0) for v in attached_volumes) * discount_factor
+                            
+                            total_monthly_savings += ec2_monthly + ebs_monthly
                         else:
                             pricing_unavailable += 1
                     elif service_type == 'EBS':
-                        total_monthly_savings += r['instance'].get('monthly_cost', 0)
-                    else:  # S3
-                        size_gb = r['instance'].get('size_gb', 0)
-                        storage_class = r['instance'].get('storage_class', 'StandardStorage')
-                        region = r['instance'].get('region', 'us-east-1')
-                        cost_per_gb = get_pricing_cached(storage_class, region, 'S3', env)
-                        if cost_per_gb:
-                            total_monthly_savings += size_gb * cost_per_gb
-                        else:
-                            pricing_unavailable += 1
+                        total_monthly_savings += r['instance'].get('monthly_cost', 0) * discount_factor
             
             if pricing_unavailable > 0:
                 st.warning(f"⚠️ Pricing data unavailable for {pricing_unavailable} instance(s). Click '💲 Reload Pricing' in sidebar.")
@@ -1781,9 +2351,17 @@ class DashboardUI:
             with savings_col2:
                 st.metric("Annual Savings", f"${total_monthly_savings * 12:,.2f}")
             with savings_col3:
-                # Calculate daily savings rate
-                daily_rate = total_monthly_savings / 30
+                # FIXED: Calculate daily savings rate using hourly * 24 for consistency
+                # This is mathematically consistent with monthly = hourly * hours_per_month
+                # Using average hours per day (24) for accurate daily rate
+                daily_rate = total_monthly_savings / 30.42  # Average days per month
                 st.metric("Daily Rate", f"${daily_rate:,.2f}/day")
+            
+            # Show pricing model info if not On-Demand
+            pricing_model = pricing_settings.get('pricing_model', 'On-Demand')
+            if pricing_model != 'On-Demand':
+                coverage = int(max(ri_coverage, sp_coverage) * 100)
+                st.caption(f"📊 {pricing_model} coverage applied: {coverage}% discount | Using actual hours: {use_actual_runtime}")
         
         # Detailed Results
         st.markdown('<div class="section-divider"></div>', unsafe_allow_html=True)
@@ -1830,8 +2408,6 @@ class DashboardUI:
                     search_text = f"{instance.get('instance_id', '')} {instance.get('name', '')}"
                 elif service_type == 'EBS':
                     search_text = f"{instance.get('volume_id', '')} {instance.get('name', '')}"
-                else:  # S3
-                    search_text = instance.get('name', '')
                 
                 if search_results.lower() not in search_text.lower():
                     continue
@@ -1952,15 +2528,9 @@ class DashboardUI:
                         elif service_type == 'EBS':
                             st.write(f"**Volume Type:** {instance.get('volume_type')}")
                             st.write(f"**Size:** {instance.get('size_gb')} GB")
-                        else:  # S3
-                            st.write(f"**Bucket:** {instance['name']}")
-                            st.write(f"**Region:** {instance.get('region')}")
                     
                     with info_col2:
-                        if service_type == 'S3':
-                            st.write(f"**Size:** {instance.get('size_gb', 0):.4f} GB")
-                            st.write(f"**Objects:** {instance.get('object_count', 0):,}")
-                        elif service_type == 'EBS':
+                        if service_type == 'EBS':
                             st.write(f"**Attached To:** {instance.get('attached_instance_id', 'Unattached')}")
                             st.write(f"**Status:** {instance.get('status')}")
                         else:
@@ -2107,7 +2677,7 @@ class DashboardUI:
             <div class="aws-feature-card" style="margin-bottom: 1.5rem;">
                 <div class="feature-icon green">🎯</div>
                 <h3>Idle Detection</h3>
-                <p>Advanced heuristics detect zombies, underutilized databases, and orphan S3 buckets based on activity patterns.</p>
+                <p>Advanced heuristics detect zombies, underutilized databases, and orphan EBS volumes based on activity patterns.</p>
             </div>
             <div class="aws-feature-card">
                 <div class="feature-icon purple">🚀</div>
@@ -2240,7 +2810,7 @@ def main():
     
     # Get user inputs from sidebar
     manager, service_type, region, scan_button, analyze_button, selected_instance = ui.render_sidebar()
-    cloudwatch_hours, activity_days, idle_threshold = ui.render_parameters()
+    cloudwatch_hours, activity_days, idle_threshold, pricing_settings = ui.render_parameters()
 
     # Handle analyze button
     if analyze_button and selected_instance:
@@ -2262,11 +2832,11 @@ def main():
 
     # Display single instance analysis
     if st.session_state.instance_analysis_active:
-        ui.display_single_analysis(manager, service_type, st.session_state.analyzing_instance, cloudwatch_hours, activity_days)
+        ui.display_single_analysis(manager, service_type, st.session_state.analyzing_instance, cloudwatch_hours, activity_days, pricing_settings)
     
     # Display scan results
     elif st.session_state.scan_results:
-        ui.display_scan_results(service_type)
+        ui.display_scan_results(service_type, pricing_settings)
     
     # Display home screen
     else:

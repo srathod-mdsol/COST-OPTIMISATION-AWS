@@ -137,7 +137,7 @@ dashboard() {
     
     # Run Streamlit
     streamlit run "$SCRIPT_DIR/ui/dashboard.py" \
-        --server.port 8501 \
+        # --server.port 8502 \
         --server.address localhost \
         --browser.gatherUsageStats false
 }

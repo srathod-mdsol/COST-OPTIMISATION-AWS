@@ -12,9 +12,6 @@ logger = setup_logger(__name__)
 class BaseServiceManager:
     """Base class for AWS service managers with dual-mode support (ETL vs Direct API)"""
     
-    # Class-level cache for ETL provider to avoid repeated initialization
-    _etl_provider_cache = {}
-    
     def __init__(self, service_name: str, region: str = 'us-east-1', use_etl: bool = None, aws_environment: str = 'Default'):
         self.service_name = service_name
         self.region = region
@@ -24,7 +21,7 @@ class BaseServiceManager:
         
         self.client = None
         self.cloudwatch = None
-        self._etl_provider = None  # Instance-level cache
+        self._etl_provider = None
         
         if not self.use_etl:
             try:
@@ -68,25 +65,11 @@ class BaseServiceManager:
 
     def get_etl_provider(self):
         """Lazy import/check for ETL provider to avoid circular dependencies.
-        Uses caching to avoid repeated database initialization."""
-        # Check instance-level cache first
-        if self._etl_provider is not None:
-            return self._etl_provider
-        
-        # Check class-level cache for this environment
-        cache_key = self.aws_environment
-        if cache_key in BaseServiceManager._etl_provider_cache:
-            self._etl_provider = BaseServiceManager._etl_provider_cache[cache_key]
-            return self._etl_provider
-        
-        # Create new provider and cache it
+        Always creates a fresh provider instance to ensure data accuracy."""
+        # Create fresh provider each time to ensure latest data
         from etl.data_provider import create_data_provider
         db_path = Config.get_db_path(self.aws_environment)
         provider = create_data_provider(db_path)
-        
-        # Cache at both levels
-        self._etl_provider = provider
-        BaseServiceManager._etl_provider_cache[cache_key] = provider
         
         return provider
 

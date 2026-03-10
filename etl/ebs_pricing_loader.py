@@ -8,7 +8,7 @@ import json
 from typing import Optional, Dict
 from core.logger import setup_logger
 from core.config import Config
-from core.constants import AWS_LOCATION_TO_REGION
+from core.constants import AWS_LOCATION_TO_REGION, DAYS_PER_MONTH
 from etl.base_db import BaseDatabase, DatabaseType
 
 logger = setup_logger(__name__)
@@ -238,25 +238,99 @@ class EBSPricingLoader(BaseDatabase):
         return fallback.get(region, 'US East (N. Virginia)')
     
     def calculate_volume_cost(self, size_gb: int, volume_type: str, 
-                             iops: int = None, region: str = 'us-east-1') -> Dict:
-        """Calculate monthly cost for an EBS volume"""
+                             iops: int = None, region: str = None, 
+                             throughput_mbps: int = None) -> Dict:
+        """Calculate monthly cost for an EBS volume with full breakdown
+        
+        Provides itemized cost breakdown:
+        - Storage cost (based on volume type and size)
+        - IOPS cost (for provisioned IOPS volumes - io1, io2, gp3)
+        - Throughput cost (for gp3 provisioned throughput)
+        
+        Args:
+            size_gb: Volume size in GB
+            volume_type: Volume type (gp3, gp2, io1, io2, st1, sc1, magnetic)
+            iops: Provisioned IOPS (for io1, io2, gp3)
+            region: AWS region code
+            throughput_mbps: Provisioned throughput in MB/s (for gp3)
+            
+        Returns:
+            Dictionary with cost breakdown
+        """
+        # Use provided region or try to get from config, don't default to us-east-1
+        if not region:
+            from core.config import Config
+            region = getattr(Config, 'DEFAULT_REGION', 'us-east-1')
+        
+        from core.constants import EBS_GP3_BASE_IOPS, EBS_GP3_BASE_THROUGHPUT_MBPS
+        
+        # Get storage price per GB
         price_per_gb = self.get_ebs_price(volume_type, region)
+        storage_monthly = size_gb * price_per_gb
         
-        base_cost = size_gb * price_per_gb
-        
-        # Add provisioned IOPS cost if applicable
+        # Calculate IOPS cost if applicable
         iops_cost = 0
-        if iops and volume_type in ['io1', 'io2']:
-            iops_price = self.get_iops_price(volume_type, region)
-            iops_cost = iops * iops_price
+        iops_rate = 0
+        extra_iops = 0
+        base_iops_included = 0
         
-        monthly = base_cost + iops_cost
+        if iops and volume_type in ['io1', 'io2', 'gp3']:
+            # gp3 includes baseline IOPS, io1/io2 do not
+            base_iops_included = EBS_GP3_BASE_IOPS if volume_type == 'gp3' else 0
+            extra_iops = max(0, iops - base_iops_included)
+            
+            if extra_iops > 0:
+                iops_rate = self.get_iops_price(volume_type, region)
+                iops_cost = extra_iops * iops_rate
+        
+        # Calculate throughput cost if applicable (gp3 only)
+        throughput_cost = 0
+        throughput_rate = 0
+        extra_throughput = 0
+        base_throughput_included = 0
+        
+        if throughput_mbps and volume_type == 'gp3':
+            base_throughput_included = EBS_GP3_BASE_THROUGHPUT_MBPS
+            extra_throughput = max(0, throughput_mbps - base_throughput_included)
+            
+            if extra_throughput > 0:
+                # Throughput is typically $0.04 per MB/s/month for gp3
+                throughput_rate = 0.04
+                throughput_cost = extra_throughput * throughput_rate
+        
+        # Calculate totals
+        monthly = storage_monthly + iops_cost + throughput_cost
+        hourly = monthly / 730  # Average hours per month
+        daily = monthly / 30
+        yearly = monthly * 12
         
         return {
             'monthly': monthly,
-            'daily': monthly / 30,
-            'yearly': monthly * 12,
-            'base_cost': base_cost,
+            'hourly': hourly,
+            'daily': daily,
+            'yearly': yearly,
+            
+            # Storage breakdown
+            'storage_monthly': storage_monthly,
+            'storage_rate': price_per_gb,
+            'size_gb': size_gb,
+            
+            # IOPS breakdown
+            'iops_monthly': iops_cost,
+            'iops_rate': iops_rate,
+            'iops_provisioned': iops,
+            'iops_base_included': base_iops_included,
+            'iops_extra': extra_iops,
+            
+            # Throughput breakdown (gp3 only)
+            'throughput_monthly': throughput_cost,
+            'throughput_rate': throughput_rate,
+            'throughput_provisioned': throughput_mbps,
+            'throughput_base_included': base_throughput_included,
+            'throughput_extra': extra_throughput,
+            
+            # Legacy fields for compatibility
+            'base_cost': storage_monthly,
             'iops_cost': iops_cost,
             'price_per_gb': price_per_gb
         }
