@@ -4,7 +4,6 @@ from datetime import datetime, timezone, timedelta
 from services.base_manager import BaseServiceManager
 from utils.rate_limiter import rate_limiter
 from core.logger import setup_logger
-import streamlit as st
 from core.config import Config
 from core.constants import (
     SECONDS_PER_HOUR,
@@ -39,6 +38,15 @@ class RDSManager(BaseServiceManager):
             instances = provider.list_instances('RDS', self.region)
             result = []
             for inst in instances:
+                # Parse raw_data to extract additional fields
+                raw_data = inst.get('raw_data', {})
+                if isinstance(raw_data, str):
+                    import json
+                    try:
+                        raw_data = json.loads(raw_data)
+                    except:
+                        raw_data = {}
+                
                 res = {
                     'instance_id': inst.get('instance_id'),
                     'instance_class': inst.get('instance_class'),
@@ -49,13 +57,25 @@ class RDSManager(BaseServiceManager):
                     'storage_type': inst.get('storage_type'),
                     'multi_az': inst.get('multi_az', False),
                     'availability_zone': inst.get('availability_zone'),
-                    'endpoint': inst.get('endpoint'),
+                    'endpoint': inst.get('endpoint') or raw_data.get('endpoint_address'),
+                    'port': raw_data.get('endpoint_port'),
                     'publicly_accessible': inst.get('publicly_accessible'),
                     'vpc_id': inst.get('vpc_id'),
                     'db_instance_arn': inst.get('db_instance_arn'),
                     'backup_retention': inst.get('backup_retention'),
                     'maintenance_window': inst.get('maintenance_window'),
                     'backup_window': inst.get('backup_window'),
+                    # New fields from raw_data
+                    'read_replicas': raw_data.get('read_replicas', []),
+                    'read_replica_count': raw_data.get('read_replica_count', 0),
+                    'iam_auth_enabled': raw_data.get('iam_auth_enabled', False),
+                    'deletion_protection': raw_data.get('deletion_protection', False),
+                    'performance_insights_enabled': raw_data.get('performance_insights_enabled', False),
+                    'enhanced_monitoring_enabled': raw_data.get('enhanced_monitoring_enabled', False),
+                    'monitoring_interval': raw_data.get('monitoring_interval', 0),
+                    'license_model': raw_data.get('license_model', ''),
+                    'db_name': raw_data.get('db_name', ''),
+                    'master_username': raw_data.get('master_username', ''),
                     'raw_data': inst.get('raw_data'),
                     'environment_tag': inst.get('environment_tag'),
                     'region': inst.get('region', self.region),  # Ensure region is always present
@@ -94,6 +114,10 @@ class RDSManager(BaseServiceManager):
                     az = db.get('AvailabilityZone', '')
                     region_from_az = az[:-1] if az and az[-1].isalpha() else self.region
                     
+                    # Get endpoint port
+                    endpoint = db.get('Endpoint', {})
+                    read_replicas = db.get('ReadReplicaDBInstanceIdentifiers', [])
+                    
                     instances.append({
                         'instance_id': db['DBInstanceIdentifier'],
                         'instance_class': db['DBInstanceClass'],
@@ -103,8 +127,25 @@ class RDSManager(BaseServiceManager):
                         'allocated_storage': db['AllocatedStorage'],
                         'storage_type': db['StorageType'],
                         'multi_az': db['MultiAZ'],
+                        'deployment_option': 'Multi-AZ' if db.get('MultiAZ') else 'Single-AZ',
+                        'license_model': db.get('LicenseModel', ''),
                         'availability_zone': az,
-                        'endpoint': db.get('Endpoint', {}).get('Address'),
+                        'endpoint': endpoint.get('Address'),
+                        'port': endpoint.get('Port'),
+                        'publicly_accessible': db.get('PubliclyAccessible'),
+                        'read_replicas': read_replicas,
+                        'read_replica_count': len(read_replicas),
+                        'iam_auth_enabled': db.get('IAMDatabaseAuthenticationEnabled', False),
+                        'deletion_protection': db.get('DeletionProtection', False),
+                        'performance_insights_enabled': db.get('PerformanceInsightsEnabled', False),
+                        'enhanced_monitoring_enabled': db.get('MonitoringInterval', 0) > 0,
+                        'monitoring_interval': db.get('MonitoringInterval', 0),
+                        'db_name': db.get('DBName', ''),
+                        'master_username': db.get('MasterUsername', ''),
+                        'vpc_id': db.get('DBSubnetGroup', {}).get('VpcId') if db.get('DBSubnetGroup') else None,
+                        'backup_retention': db.get('BackupRetentionPeriod'),
+                        'maintenance_window': db.get('PreferredMaintenanceWindow'),
+                        'backup_window': db.get('PreferredBackupWindow'),
                         'raw_data': json.dumps({'tags': tags}),
                         'environment_tag': next((v for k, v in tags.items() if k.lower() == 'environment'), 'Unknown'),
                         'region': region_from_az or self.region,  # Ensure region is always present

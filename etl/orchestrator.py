@@ -71,6 +71,137 @@ class ETLOrchestrator(BaseDatabase):
                 raise Exception(f"AWS Session for '{aws_environment}' has expired.")
             raise
 
+    def get_all_aws_regions(self, aws_environment: str = 'Default') -> List[str]:
+        """Discover all available AWS regions using boto3 Session.
+        
+        Uses session.get_available_regions() to get regions for EC2 and RDS
+        services and returns a combined unique list of all regions.
+        Regions are cached in the aws_regions table for faster access.
+        
+        Args:
+            aws_environment: AWS environment name for credentials
+            
+        Returns:
+            Sorted list of unique region names
+        """
+        from core.constants import AWS_REGIONS  # Fallback list
+        
+        # First, try to get regions from the database cache
+        try:
+            cached_regions = self.fetch_all(
+                "SELECT region_name FROM aws_regions WHERE is_enabled = TRUE ORDER BY region_name"
+            )
+            if cached_regions and len(cached_regions) > 0:
+                logger.info(f"Using {len(cached_regions)} cached regions from database")
+                return [r['region_name'] for r in cached_regions]
+        except Exception as e:
+            logger.debug(f"Could not fetch regions from cache: {e}")
+        
+        # Discover regions from AWS API
+        try:
+            creds = Config.get_aws_credentials(aws_environment)
+            session_kwargs = {}
+            if creds.get('aws_access_key_id'):
+                session_kwargs['aws_access_key_id'] = creds['aws_access_key_id']
+                session_kwargs['aws_secret_access_key'] = creds['aws_secret_access_key']
+            if creds.get('aws_session_token'):
+                session_kwargs['aws_session_token'] = creds['aws_session_token']
+            
+            # Create a session - use us-east-1 as default region for the session
+            session_kwargs['region_name'] = 'us-east-1'
+            session = boto3.Session(**session_kwargs)
+            
+            # Get regions for each service we use
+            all_regions = set()
+            for service in ['ec2', 'rds']:
+                try:
+                    regions = session.get_available_regions(service)
+                    all_regions.update(regions)
+                except Exception as e:
+                    logger.warning(f"Could not get regions for service {service}: {e}")
+            
+            if all_regions:
+                logger.info(f"Discovered {len(all_regions)} AWS regions")
+                sorted_regions = sorted(list(all_regions))
+                
+                # Store discovered regions in the database
+                self._store_discovered_regions(sorted_regions)
+                
+                return sorted_regions
+            else:
+                logger.warning("No regions discovered, using fallback list")
+                return AWS_REGIONS
+                
+        except Exception as e:
+            logger.warning(f"Error discovering AWS regions: {e}. Using fallback list.")
+            from core.constants import AWS_REGIONS
+            return AWS_REGIONS
+
+    def _store_discovered_regions(self, regions: List[str]):
+        """Store discovered regions in the aws_regions table.
+        
+        Args:
+            regions: List of region names to store
+        """
+        try:
+            current_ts = datetime.now(timezone.utc).isoformat()
+            
+            # Determine region groups based on region name prefixes
+            def get_region_group(region_name: str) -> str:
+                if region_name.startswith('us-'):
+                    return 'Americas'
+                elif region_name.startswith('eu-'):
+                    return 'Europe'
+                elif region_name.startswith('ap-'):
+                    return 'Asia Pacific'
+                elif region_name.startswith('sa-'):
+                    return 'South America'
+                elif region_name.startswith('ca-'):
+                    return 'Canada'
+                elif region_name.startswith('me-'):
+                    return 'Middle East'
+                elif region_name.startswith('af-'):
+                    return 'Africa'
+                else:
+                    return 'Other'
+            
+            for region in regions:
+                region_group = get_region_group(region)
+                
+                # Use UPSERT pattern - insert or update
+                if self.db_type == DatabaseType.POSTGRESQL:
+                    self.execute("""
+                        INSERT INTO aws_regions (region_name, region_group, is_enabled, discovered_at, last_seen_at)
+                        VALUES (:region, :region_group, TRUE, :ts, :ts)
+                        ON CONFLICT (region_name) DO UPDATE SET last_seen_at = :ts, is_enabled = TRUE
+                    """, {"region": region, "region_group": region_group, "ts": current_ts})
+                elif self.db_type == DatabaseType.MYSQL:
+                    self.execute("""
+                        INSERT INTO aws_regions (region_name, region_group, is_enabled, discovered_at, last_seen_at)
+                        VALUES (:region, :region_group, TRUE, :ts, :ts)
+                        ON DUPLICATE KEY UPDATE last_seen_at = :ts, is_enabled = TRUE
+                    """, {"region": region, "region_group": region_group, "ts": current_ts})
+                else:
+                    # SQLite and others - use simpler approach
+                    existing = self.fetch_value(
+                        "SELECT COUNT(*) FROM aws_regions WHERE region_name = :region",
+                        {"region": region}
+                    )
+                    if existing == 0:
+                        self.execute("""
+                            INSERT INTO aws_regions (region_name, region_group, is_enabled, discovered_at, last_seen_at)
+                            VALUES (:region, :region_group, TRUE, :ts, :ts)
+                        """, {"region": region, "region_group": region_group, "ts": current_ts})
+                    else:
+                        self.execute("""
+                            UPDATE aws_regions SET last_seen_at = :ts, is_enabled = TRUE WHERE region_name = :region
+                        """, {"region": region, "ts": current_ts})
+            
+            logger.info(f"Stored {len(regions)} regions in aws_regions table")
+            
+        except Exception as e:
+            logger.warning(f"Error storing regions in database: {e}")
+
     def _ensure_schema(self):
         """Ensure database schema and lock table exists.
         
@@ -218,6 +349,17 @@ class ETLOrchestrator(BaseDatabase):
             )
         ''')
 
+        # AWS Regions table - stores discovered regions
+        self.execute(f'''
+            CREATE TABLE IF NOT EXISTS aws_regions (
+                region_name {text_type} PRIMARY KEY,
+                region_group {text_type},
+                is_enabled {boolean_type} DEFAULT TRUE,
+                discovered_at {timestamp_type} DEFAULT {current_ts},
+                last_seen_at {timestamp_type}
+            )
+        ''')
+
         # Create indexes
         self.create_index_if_not_exists('idx_tags_instance', 'instance_tags', ['instance_id'])
         self.create_index_if_not_exists('idx_raw_instances_service_type', 'raw_instances', ['service_type'])
@@ -325,8 +467,9 @@ class ETLOrchestrator(BaseDatabase):
         records_extracted = 0
         records_loaded = 0
         
-        services = services or ['RDS', 'EC2', 'EBS', 'S3']
-        regions = regions or ['us-east-1']
+        services = services or ['RDS', 'EC2', 'EBS']
+        if regions is None:
+            regions = self.get_all_aws_regions(aws_environment)
         
         try:
             logger.info(f"Starting ETL run: {run_type}, services={services}, regions={regions}, env={aws_environment}")
@@ -340,8 +483,6 @@ class ETLOrchestrator(BaseDatabase):
                             instances, metrics = self._extract_ec2(region, aws_environment)
                         elif service == 'EBS':
                             instances, metrics = self._extract_ebs(region, aws_environment)
-                        elif service == 'S3':
-                            instances, metrics = self._extract_s3(region, aws_environment)
                         else:
                             continue
                         
@@ -439,6 +580,9 @@ class ETLOrchestrator(BaseDatabase):
             except Exception as e:
                 logger.debug(f"Could not fetch tags for RDS {id}: {e}")
             
+            # Get read replica info
+            read_replicas = db.get('ReadReplicaDBInstanceIdentifiers', [])
+            
             inst = {
                 'instance_id': id, 'service_type': 'RDS', 'region': region,
                 'instance_class': db['DBInstanceClass'], 'engine': db['Engine'],
@@ -456,13 +600,44 @@ class ETLOrchestrator(BaseDatabase):
                     'db_instance_arn': db.get('DBInstanceArn'),
                     'backup_retention': db.get('BackupRetentionPeriod'),
                     'maintenance_window': db.get('PreferredMaintenanceWindow'),
-                    'backup_window': db.get('PreferredBackupWindow')
+                    'backup_window': db.get('PreferredBackupWindow'),
+                    'endpoint_address': db.get('Endpoint', {}).get('Address'),
+                    'endpoint_port': db.get('Endpoint', {}).get('Port'),
+                    'read_replicas': read_replicas,
+                    'read_replica_count': len(read_replicas),
+                    'iam_auth_enabled': db.get('IAMDatabaseAuthenticationEnabled', False),
+                    'deletion_protection': db.get('DeletionProtection', False),
+                    'performance_insights_enabled': db.get('PerformanceInsightsEnabled', False),
+                    'enhanced_monitoring_enabled': db.get('MonitoringInterval', 0) > 0,
+                    'monitoring_interval': db.get('MonitoringInterval', 0),
+                    'license_model': db.get('LicenseModel', ''),
+                    'db_name': db.get('DBName', ''),
+                    'master_username': db.get('MasterUsername', ''),
                 })
             }
             
             instance_metrics = []
-            # Extract metrics for this instance
-            for mname in ['CPUUtilization', 'DatabaseConnections', 'FreeableMemory', 'ReadIOPS', 'WriteIOPS', 'NetworkReceiveThroughput', 'NetworkTransmitThroughput']:
+            # Extract metrics for this instance - including health & performance metrics
+            rds_metrics = [
+                'CPUUtilization', 
+                'DatabaseConnections', 
+                'FreeableMemory', 
+                'ReadIOPS', 
+                'WriteIOPS', 
+                'NetworkReceiveThroughput', 
+                'NetworkTransmitThroughput',
+                'FreeStorageSpace',  # Free storage space in bytes
+                'ReadLatency',       # Read latency in seconds
+                'WriteLatency',      # Write latency in seconds
+                'ReadThroughput',    # Read throughput
+                'WriteThroughput',   # Write throughput
+            ]
+            
+            # Add replication lag metric only if this is a source DB or has replicas
+            if read_replicas or db.get('MultiAZ'):
+                rds_metrics.append('ReplicaLag')
+            
+            for mname in rds_metrics:
                 try:
                     resp = self._run_cw_with_timeout(
                         cw.get_metric_statistics,
@@ -536,6 +711,102 @@ class ETLOrchestrator(BaseDatabase):
             id = ec2_inst['InstanceId']
             name = next((t['Value'] for t in ec2_inst.get('Tags', []) if t['Key'] == 'Name'), id)
             
+            # Get IAM Instance Profile
+            iam_profile = ec2_inst.get('IamInstanceProfile', {})
+            iam_role = iam_profile.get('Arn', '').split('/')[-1] if iam_profile else ''
+            
+            # Get Instance Lifecycle (Spot/On-demand)
+            instance_lifecycle = ec2_inst.get('InstanceLifecycle', 'on-demand')
+            
+            # Get EBS volumes and calculate total storage and encryption
+            total_ebs_storage_gb = 0
+            ebs_encrypted = False
+            for ebs_vol in ec2_inst.get('BlockDeviceMappings', []):
+                try:
+                    vol_id = ebs_vol.get('Ebs', {}).get('VolumeId')
+                    if vol_id:
+                        vol_info = ec2.describe_volumes(VolumeIds=[vol_id])['Volumes'][0]
+                        total_ebs_storage_gb += vol_info.get('Size', 0)
+                        ebs_encrypted = ebs_encrypted or vol_info.get('Encrypted', False)
+                except:
+                    pass
+            
+            # Get OS Version from ImageId (simplified)
+            image_id = ec2_inst.get('ImageId', '')
+            os_version = 'Linux/UNIX'
+            eol_date = None
+            eol_status = 'supported'
+            
+            # Try to get more details from image
+            try:
+                image_info = ec2.describe_images(ImageIds=[image_id])['Images'][0] if image_id else None
+                if image_info:
+                    platform_details = image_info.get('PlatformDetails', '')
+                    description = image_info.get('Description', '')
+                    
+                    # Determine OS and approximate version
+                    if 'ubuntu' in platform_details.lower() or 'ubuntu' in description.lower():
+                        os_version = 'Ubuntu'
+                        # Ubuntu EOL dates (approximate)
+                        if '22.04' in description or 'jammy' in description.lower():
+                            os_version = 'Ubuntu 22.04'
+                            eol_date = '2027-04'
+                        elif '24.04' in description or 'noble' in description.lower():
+                            os_version = 'Ubuntu 24.04'
+                            eol_date = '2029-04'
+                        elif '20.04' in description or 'focal' in description.lower():
+                            os_version = 'Ubuntu 20.04'
+                            eol_date = '2025-04'
+                            eol_status = 'near_eol' if datetime.now(timezone.utc) < datetime(2025, 4, 1, tzinfo=timezone.utc) else 'eol'
+                        elif '18.04' in description or 'bionic' in description.lower():
+                            os_version = 'Ubuntu 18.04'
+                            eol_date = '2023-06'
+                            eol_status = 'eol'
+                    elif 'amazon linux' in platform_details.lower() or 'amazon linux' in description.lower():
+                        os_version = 'Amazon Linux'
+                        # Amazon Linux 2 EOL is around 2025, AL2023 is longer
+                        if 'al2023' in description.lower():
+                            os_version = 'Amazon Linux 2023'
+                            eol_date = '2028-03'
+                        elif 'al2' in description.lower():
+                            os_version = 'Amazon Linux 2'
+                            eol_date = '2025-06'
+                            eol_status = 'near_eol' if datetime.now(timezone.utc) < datetime(2025, 6, 1, tzinfo=timezone.utc) else 'eol'
+                    elif 'windows' in platform_details.lower():
+                        os_version = 'Windows Server'
+                        # Windows Server EOL varies by version
+                        if '2019' in description:
+                            os_version = 'Windows Server 2019'
+                            eol_date = '2029-01'
+                        elif '2022' in description:
+                            os_version = 'Windows Server 2022'
+                            eol_date = '2032-01'
+                        elif '2016' in description:
+                            os_version = 'Windows Server 2016'
+                            eol_date = '2027-01'
+                    elif 'red hat' in platform_details.lower() or 'rhel' in platform_details.lower():
+                        os_version = 'RHEL'
+                        # RHEL versions typically supported for 10 years
+                        if '8.' in description:
+                            os_version = 'RHEL 8'
+                            eol_date = '2029-05'
+                        elif '9.' in description:
+                            os_version = 'RHEL 9'
+                            eol_date = '2032-05'
+            except:
+                pass
+            
+            # Calculate EOL status
+            if eol_date:
+                try:
+                    eol_dt = datetime.strptime(eol_date, '%Y-%m')
+                    if eol_dt < datetime.now(timezone.utc):
+                        eol_status = 'eol'
+                    elif (eol_dt - datetime.now(timezone.utc)).days < 180:
+                        eol_status = 'near_eol'
+                except:
+                    pass
+            
             inst = {
                 'instance_id': id, 'service_type': 'EC2', 'region': region,
                 'instance_class': ec2_inst['InstanceType'], 
@@ -550,16 +821,24 @@ class ETLOrchestrator(BaseDatabase):
                     'private_ip': ec2_inst.get('PrivateIpAddress'),
                     'architecture': ec2_inst.get('Architecture'),
                     'subnet_id': ec2_inst.get('SubnetId'),
-                    'image_id': ec2_inst.get('ImageId'),
+                    'image_id': image_id,
                     'root_device': ec2_inst.get('RootDeviceType'),
                     'virtualization': ec2_inst.get('VirtualizationType'),
                     'availability_zone': ec2_inst.get('Placement', {}).get('AvailabilityZone'),
-                    'ebs_volume_count': len(ec2_inst.get('BlockDeviceMappings', []))
+                    'ebs_volume_count': len(ec2_inst.get('BlockDeviceMappings', [])),
+                    'iam_role': iam_role,
+                    'instance_lifecycle': instance_lifecycle,
+                    'total_ebs_storage_gb': total_ebs_storage_gb,
+                    'ebs_encrypted': ebs_encrypted,
+                    'os_version': os_version,
+                    'eol_date': eol_date,
+                    'eol_status': eol_status
                 })
             }
             
             instance_metrics = []
-            for mname in ['CPUUtilization', 'NetworkIn', 'NetworkOut', 'DiskReadBytes', 'DiskWriteBytes']:
+            # Collect standard CloudWatch metrics
+            for mname in ['CPUUtilization', 'NetworkIn', 'NetworkOut', 'DiskReadBytes', 'DiskWriteBytes', 'StatusCheckFailed']:
                 try:
                     resp = self._run_cw_with_timeout(
                         cw.get_metric_statistics,
@@ -618,109 +897,6 @@ class ETLOrchestrator(BaseDatabase):
                     logger.error(f"Error processing EC2 instance {instance_id}: {e}")
         
         logger.info(f"Completed processing {len(instances)} EC2 instances with {len(metrics)} metrics")
-        return instances, metrics
-
-    def _extract_s3(self, region, aws_environment: str = 'Default'):
-        """Extract S3 buckets and metrics using multi-threading"""
-        s3, cw = self._get_aws_clients('s3', region, aws_environment)
-        
-        instances = []
-        metrics = []
-        instances_lock = threading.Lock()
-        metrics_lock = threading.Lock()
-        
-        def process_s3_bucket(b, count):
-            """Process a single S3 bucket and its metrics"""
-            logger.info(f"Processing S3 bucket {count}")
-            name = b['Name']
-            
-            try:
-                loc = s3.get_bucket_location(Bucket=name).get('LocationConstraint') or 'us-east-1'
-                if loc != region:
-                    return None, []
-                
-                size_gb = 0
-                object_count = 0
-                try:
-                    resp = cw.get_metric_statistics(
-                        Namespace='AWS/S3', MetricName='BucketSizeBytes',
-                        Dimensions=[{'Name': 'BucketName', 'Value': name}, {'Name': 'StorageType', 'Value': 'StandardStorage'}],
-                        StartTime=datetime.now(timezone.utc) - timedelta(days=2),
-                        EndTime=datetime.now(timezone.utc), Period=86400, Statistics=['Average']
-                    )
-                    if resp.get('Datapoints'):
-                        size_gb = resp['Datapoints'][-1]['Average'] / (1024**3)
-                except Exception as e:
-                    logger.debug(f"Error fetching S3 BucketSizeBytes for {name}: {e}")
-                
-                try:
-                    count_resp = cw.get_metric_statistics(
-                        Namespace='AWS/S3', MetricName='NumberOfObjects',
-                        Dimensions=[{'Name': 'BucketName', 'Value': name}, {'Name': 'StorageType', 'Value': 'AllStorageTypes'}],
-                        StartTime=datetime.now(timezone.utc) - timedelta(days=2),
-                        EndTime=datetime.now(timezone.utc), Period=86400, Statistics=['Average']
-                    )
-                    if count_resp.get('Datapoints'):
-                        object_count = int(count_resp['Datapoints'][-1]['Average'])
-                except Exception as e:
-                    logger.debug(f"Error fetching S3 NumberOfObjects for {name}: {e}")
-                
-                # Fetch S3 bucket tags
-                s3_tags = []
-                try:
-                    tags_response = s3.get_bucket_tagging(Bucket=name)
-                    s3_tags = [{'Key': tag['Key'], 'Value': tag['Value']} for tag in tags_response.get('TagSet', [])]
-                except Exception as e:
-                    # Bucket may not have tags, which is normal
-                    logger.debug(f"No tags or error fetching tags for S3 bucket {name}: {e}")
-                
-                inst = {
-                    'instance_id': name, 'service_type': 'S3', 'region': region,
-                    'instance_class': 'S3', 'engine': 'S3', 'status': 'active',
-                    'created_date': b.get('CreationDate', datetime.now(timezone.utc)).isoformat(),
-                    'raw_data': json.dumps({'size_gb': size_gb, 'object_count': object_count})
-                }
-                return inst, [], s3_tags
-            except Exception as e:
-                logger.warning(f"Failed to process S3 bucket {name}: {e}")
-                return None, [], []
-        
-        try:
-            # Collect all buckets first
-            all_buckets = s3.list_buckets().get('Buckets', [])
-            
-            logger.info(f"Found {len(all_buckets)} S3 buckets. Starting multi-threaded processing...")
-            
-            # Process buckets concurrently using thread pool
-            max_workers = min(self.MAX_CONCURRENT_WORKERS, len(all_buckets)) if all_buckets else 1
-            with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                # Submit all tasks
-                future_to_bucket = {}
-                for count, b in enumerate(all_buckets, start=1):
-                    future = executor.submit(process_s3_bucket, b, count)
-                    future_to_bucket[future] = b
-                
-                # Collect results as they complete
-                for future in as_completed(future_to_bucket):
-                    try:
-                        instance, instance_metrics, s3_tags = future.result()
-                        if instance:  # Skip if bucket not in target region
-                            with instances_lock:
-                                instances.append(instance)
-                                # Store tags with instance for deferred insertion (after instance is loaded)
-                                if s3_tags:
-                                    instance['_tags'] = s3_tags
-                            with metrics_lock:
-                                metrics.extend(instance_metrics)
-                    except Exception as e:
-                        b = future_to_bucket[future]
-                        bucket_name = b.get('Name', 'unknown')
-                        logger.error(f"Error processing S3 bucket {bucket_name}: {e}")
-            
-            logger.info(f"Completed processing {len(instances)} S3 buckets in {region}")
-        except Exception as e:
-            logger.error(f"Failed to list S3 buckets: {e}")
-            
         return instances, metrics
 
     def _extract_ebs(self, region, aws_environment: str = 'Default'):

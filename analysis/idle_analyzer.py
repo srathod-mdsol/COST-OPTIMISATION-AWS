@@ -7,7 +7,6 @@ from core.constants import (
     READ_IOPS_IDLE_THRESHOLD, WRITE_IOPS_IDLE_THRESHOLD,
     NETWORK_IDLE_THRESHOLD,
     DISK_READ_IDLE_THRESHOLD, DISK_WRITE_IDLE_THRESHOLD,
-    S3_REQUESTS_IDLE_THRESHOLD,
     ACTIVITY_WEIGHT, CPU_LOW_WEIGHT, CPU_VERY_LOW_WEIGHT,
     NO_CONNECTIONS_WEIGHT, NO_READ_WEIGHT, NO_WRITE_WEIGHT,
     NETWORK_LOW_WEIGHT, DISK_READ_WEIGHT, DISK_WRITE_WEIGHT,
@@ -22,13 +21,129 @@ class IdleAnalyzer:
     """Analyzes instances for idle status based on metrics and activity"""
     
     @staticmethod
+    def _calculate_activity_indicators(
+        days_since: float,
+        activity_threshold_days: int,
+        grace_period: float,
+        indicators: list
+    ) -> None:
+        """Shared logic for activity-based idle detection.
+        
+        This method is used by analyze_rds, analyze_ec2, and analyze_ebs to avoid
+        code duplication.
+        
+        Args:
+            days_since: Days since last activity (None if no activity)
+            activity_threshold_days: User-defined threshold in days
+            grace_period: Grace period (10% of threshold)
+            indicators: List to append indicators to
+        """
+        if days_since is None or days_since == float('inf'):
+            # No activity detected at all in the entire lookback period
+            indicators.append({
+                'name': f'No Activity in Last {activity_threshold_days} Days',
+                'value': 'No activity detected',
+                'severity': 'critical',
+                'weight': ACTIVITY_WEIGHT
+            })
+        elif days_since >= activity_threshold_days:
+            # Exceeds the user-defined threshold
+            indicators.append({
+                'name': f'Inactive for {days_since:.1f} Days',
+                'value': f'Exceeds {activity_threshold_days}-day threshold',
+                'severity': 'critical',
+                'weight': ACTIVITY_WEIGHT
+            })
+        elif days_since >= grace_period:
+            # Between grace period and threshold - still worth noting
+            progress_ratio = (days_since - grace_period) / (activity_threshold_days - grace_period)
+            proportional_weight = int(ACTIVITY_WEIGHT * progress_ratio * 0.5)
+            if proportional_weight >= 10:
+                indicators.append({
+                    'name': f'Inactive for {days_since:.1f} Days',
+                    'value': f'Within {activity_threshold_days}-day window',
+                    'severity': 'medium',
+                    'weight': proportional_weight
+                })
+
+    @staticmethod
     def analyze_rds(metrics: Dict, last_activity: Dict, activity_threshold_days: int = 30) -> Dict:
         """Analyze RDS metrics and determine idle status."""
         indicators = []
         days_since = last_activity.get('days_since_activity')
         
-        # Calculate dynamic thresholds
+        # DEBUG: Log the inputs for debugging
+        logger.debug(f"RDS Idle Analysis - days_since: {days_since}, metrics keys: {metrics.keys() if metrics else 'None'}, last_activity: {last_activity}")
+        
+        # Calculate grace period for activity-based detection
         grace_period = max(1, activity_threshold_days * ACTIVITY_GRACE_PERCENTAGE)
+        
+        # Check for inactivity FIRST - even without metrics, we can detect idle based on last activity
+        if days_since is None or days_since == float('inf'):
+            # No activity detected at all in the entire lookback period
+            indicators.append({
+                'name': f'No Activity in Last {activity_threshold_days} Days',
+                'value': 'No activity detected',
+                'severity': 'critical',
+                'weight': ACTIVITY_WEIGHT
+            })
+        elif days_since >= activity_threshold_days:
+            # Exceeds the user-defined threshold
+            indicators.append({
+                'name': f'Inactive for {days_since:.1f} Days',
+                'value': f'Exceeds {activity_threshold_days}-day threshold',
+                'severity': 'critical',
+                'weight': ACTIVITY_WEIGHT
+            })
+        elif days_since >= grace_period:
+            # Between grace period and threshold - still worth noting
+            progress_ratio = (days_since - grace_period) / (activity_threshold_days - grace_period)
+            proportional_weight = int(ACTIVITY_WEIGHT * progress_ratio * 0.5)
+            if proportional_weight >= 10:
+                indicators.append({
+                    'name': f'Inactive for {days_since:.1f} Days',
+                    'value': f'Within {activity_threshold_days}-day window',
+                    'severity': 'medium',
+                    'weight': proportional_weight
+                })
+        
+        # If no valid metrics available, we cannot determine idle status from metrics
+        # but we've already checked activity above
+        if not metrics:
+            if indicators:
+                # We have activity-based indicators, use those
+                idle_score = min(100, sum(ind['weight'] for ind in indicators))
+                if idle_score >= SEVERITY_CRITICAL_THRESHOLD:
+                    severity = 'CRITICAL'
+                    recommendation = f"🚨 CRITICAL: No activity detected in last {activity_threshold_days} days"
+                elif idle_score >= SEVERITY_HIGH_THRESHOLD:
+                    severity = 'HIGH'
+                    recommendation = f"⚠️ HIGH: Limited activity in {activity_threshold_days}-day window"
+                elif idle_score >= SEVERITY_MEDIUM_THRESHOLD:
+                    severity = 'MEDIUM'
+                    recommendation = "📊 MEDIUM: Some idle indicators present"
+                else:
+                    severity = 'LOW'
+                    recommendation = f"✅ LOW: Active within {activity_threshold_days}-day window"
+                return {
+                    'idle_score': idle_score,
+                    'severity': severity,
+                    'indicators': indicators,
+                    'idle_reasons': [f"{ind['name']}: {ind['value']}" for ind in indicators],
+                    'active_reasons': [],
+                    'recommendation': recommendation
+                }
+            else:
+                # No metrics AND no activity data - cannot determine
+                logger.debug(f"RDS Idle Analysis - No metrics available, returning LOW severity")
+                return {
+                    'idle_score': 0,
+                    'severity': 'LOW',
+                    'indicators': [],
+                    'idle_reasons': [],
+                    'active_reasons': ['No metrics data available for analysis'],
+                    'recommendation': "⚠️ No metrics data available - cannot determine idle status"
+                }
         
         # If active within grace period, mark as clearly active
         if days_since is not None and days_since < grace_period:
@@ -137,8 +252,76 @@ class IdleAnalyzer:
         indicators = []
         days_since = last_activity.get('days_since_activity')
         
+        # Calculate grace period for activity-based detection
         grace_period = max(1, activity_threshold_days * 0.1)
         
+        # Check for inactivity FIRST - even without metrics, we can detect idle based on last activity
+        if days_since is None or days_since == float('inf'):
+            # No activity detected at all in the entire lookback period
+            indicators.append({
+                'name': f'No Activity in Last {activity_threshold_days} Days',
+                'value': 'No activity detected',
+                'severity': 'critical',
+                'weight': ACTIVITY_WEIGHT
+            })
+        elif days_since >= activity_threshold_days:
+            # Exceeds the user-defined threshold
+            indicators.append({
+                'name': f'Inactive for {days_since:.1f} Days',
+                'value': f'Exceeds {activity_threshold_days}-day threshold',
+                'severity': 'critical',
+                'weight': ACTIVITY_WEIGHT
+            })
+        elif days_since >= grace_period:
+            # Between grace period and threshold - still worth noting
+            progress_ratio = (days_since - grace_period) / (activity_threshold_days - grace_period)
+            proportional_weight = int(ACTIVITY_WEIGHT * progress_ratio * 0.5)
+            if proportional_weight >= 10:
+                indicators.append({
+                    'name': f'Inactive for {days_since:.1f} Days',
+                    'value': f'Within {activity_threshold_days}-day window',
+                    'severity': 'medium',
+                    'weight': proportional_weight
+                })
+        
+        # If no valid metrics available, we cannot determine idle status from metrics
+        # but we've already checked activity above
+        if not metrics:
+            if indicators:
+                # We have activity-based indicators, use those
+                idle_score = min(100, sum(ind['weight'] for ind in indicators))
+                if idle_score >= SEVERITY_CRITICAL_THRESHOLD:
+                    severity = 'CRITICAL'
+                    recommendation = f"🚨 CRITICAL: No activity detected in last {activity_threshold_days} days"
+                elif idle_score >= SEVERITY_HIGH_THRESHOLD:
+                    severity = 'HIGH'
+                    recommendation = f"⚠️ HIGH: Limited activity in {activity_threshold_days}-day window"
+                elif idle_score >= SEVERITY_MEDIUM_THRESHOLD:
+                    severity = 'MEDIUM'
+                    recommendation = "📊 MEDIUM: Some idle indicators present"
+                else:
+                    severity = 'LOW'
+                    recommendation = f"✅ LOW: Active within {activity_threshold_days}-day window"
+                return {
+                    'idle_score': idle_score,
+                    'severity': severity,
+                    'indicators': indicators,
+                    'idle_reasons': [f"{ind['name']}: {ind['value']}" for ind in indicators],
+                    'active_reasons': [],
+                    'recommendation': recommendation
+                }
+            else:
+                # No metrics AND no activity data - cannot determine
+                return {
+                    'idle_score': 0,
+                    'severity': 'LOW',
+                    'indicators': [],
+                    'idle_reasons': [],
+                    'active_reasons': ['No metrics data available for analysis'],
+                    'recommendation': "⚠️ No metrics data available - cannot determine idle status"
+                }
+        
+        # If active within grace period, mark as clearly active
         if days_since is not None and days_since < grace_period:
             return {
                 'idle_score': 0,
@@ -149,6 +332,7 @@ class IdleAnalyzer:
                 'recommendation': f"✅ Instance was active {days_since:.1f} days ago"
             }
         
+        # CPU-based indicators
         cpu_avg = metrics.get('CPUUtilization', {}).get('average', 0)
         if cpu_avg < 5:
             indicators.append({'name': 'Low CPU Usage', 'value': f'{cpu_avg:.2f}%', 'severity': 'high' if cpu_avg < 1 else 'medium', 'weight': 20})
@@ -220,34 +404,15 @@ class IdleAnalyzer:
         }
 
     @staticmethod
-    def analyze_s3(metrics: Dict, last_activity: Dict, bucket_info: Dict, activity_threshold_days: int = 30) -> Dict:
-        """Analyze S3 metrics and determine idle status."""
+    def analyze_ebs(metrics: Dict, last_activity: Dict, activity_threshold_days: int = 30) -> Dict:
+        """Analyze EBS metrics and determine idle status."""
         indicators = []
         days_since = last_activity.get('days_since_activity')
         
-        # S3 often has less frequent access, using S3 specific grace period constant
-        from core.constants import S3_GRACE_PERCENTAGE
-        grace_period = max(1, activity_threshold_days * S3_GRACE_PERCENTAGE)
+        # Calculate grace period for activity-based detection
+        grace_period = max(1, activity_threshold_days * ACTIVITY_GRACE_PERCENTAGE)
         
-        if days_since is not None and days_since < grace_period:
-            return {
-                'idle_score': 0,
-                'severity': 'LOW',
-                'indicators': [],
-                'idle_reasons': [],
-                'active_reasons': [f'Active {days_since:.1f} days ago (within grace period)'],
-                'recommendation': f"✅ Bucket was active {days_since:.1f} days ago"
-            }
-        
-        all_requests = metrics.get('AllRequests', {}).get('total', metrics.get('AllRequests', {}).get('average', 0))
-        if all_requests < Config.S3_REQUESTS_IDLE_THRESHOLD:
-            indicators.append({'name': 'Very Low Request Activity', 'value': f'{all_requests:.0f} requests', 'severity': 'high', 'weight': 25})
-        
-        size_gb = bucket_info.get('size_gb', 0)
-        if size_gb < 0.001:  # Size threshold for nearly empty
-            indicators.append({'name': 'Empty or Nearly Empty Bucket', 'value': f'{size_gb:.4f} GB', 'severity': 'high', 'weight': 20})
-        
-        # PRIMARY THRESHOLD CHECK - Activity-based idle detection
+        # Check for inactivity FIRST - even without metrics, we can detect idle based on last activity
         if days_since is None or days_since == float('inf'):
             # No activity detected at all in the entire lookback period
             indicators.append({
@@ -266,48 +431,54 @@ class IdleAnalyzer:
             })
         elif days_since >= grace_period:
             # Between grace period and threshold - still worth noting
-            # Calculate proportional weight based on how close to threshold
             progress_ratio = (days_since - grace_period) / (activity_threshold_days - grace_period)
-            proportional_weight = int(ACTIVITY_WEIGHT * progress_ratio * 0.5)  # Max 50% of full weight
-            if proportional_weight >= 10:  # Only add if significant
+            proportional_weight = int(ACTIVITY_WEIGHT * progress_ratio * 0.5)
+            if proportional_weight >= 10:
                 indicators.append({
                     'name': f'Inactive for {days_since:.1f} Days',
                     'value': f'Within {activity_threshold_days}-day window',
                     'severity': 'medium',
                     'weight': proportional_weight
                 })
-            
-        idle_score = min(100, sum(ind['weight'] for ind in indicators))
         
-        if idle_score >= SEVERITY_CRITICAL_THRESHOLD:
-            severity = 'CRITICAL'
-            recommendation = f"🚨 CRITICAL: No activity detected in last {activity_threshold_days} days"
-        elif idle_score >= SEVERITY_HIGH_THRESHOLD:
-            severity = 'HIGH'
-            recommendation = f"⚠️ HIGH: Limited activity in {activity_threshold_days}-day window"
-        elif idle_score >= SEVERITY_MEDIUM_THRESHOLD:
-            severity = 'MEDIUM'
-            recommendation = "📊 MEDIUM: Some idle indicators present"
-        else:
-            severity = 'LOW'
-            recommendation = f"✅ LOW: Active within {activity_threshold_days}-day window"
+        # If no valid metrics available, we cannot determine idle status from metrics
+        # but we've already checked activity above
+        if not metrics:
+            if indicators:
+                # We have activity-based indicators, use those
+                idle_score = min(100, sum(ind['weight'] for ind in indicators))
+                if idle_score >= SEVERITY_CRITICAL_THRESHOLD:
+                    severity = 'CRITICAL'
+                    recommendation = f"🚨 CRITICAL: No activity detected in last {activity_threshold_days} days"
+                elif idle_score >= SEVERITY_HIGH_THRESHOLD:
+                    severity = 'HIGH'
+                    recommendation = f"⚠️ HIGH: Limited activity in {activity_threshold_days}-day window"
+                elif idle_score >= SEVERITY_MEDIUM_THRESHOLD:
+                    severity = 'MEDIUM'
+                    recommendation = "📊 MEDIUM: Some idle indicators present"
+                else:
+                    severity = 'LOW'
+                    recommendation = f"✅ LOW: Active within {activity_threshold_days}-day window"
+                return {
+                    'idle_score': idle_score,
+                    'severity': severity,
+                    'indicators': indicators,
+                    'idle_reasons': [f"{ind['name']}: {ind['value']}" for ind in indicators],
+                    'active_reasons': [],
+                    'recommendation': recommendation
+                }
+            else:
+                # No metrics AND no activity data - cannot determine
+                return {
+                    'idle_score': 0,
+                    'severity': 'LOW',
+                    'indicators': [],
+                    'idle_reasons': [],
+                    'active_reasons': ['No metrics data available for analysis'],
+                    'recommendation': "⚠️ No metrics data available - cannot determine idle status"
+                }
         
-        return {
-            'idle_score': idle_score,
-            'severity': severity,
-            'indicators': indicators,
-            'idle_reasons': [f"{ind['name']}: {ind['value']}" for ind in indicators],
-            'recommendation': recommendation
-        }
-
-    @staticmethod
-    def analyze_ebs(metrics: Dict, last_activity: Dict, activity_threshold_days: int = 30) -> Dict:
-        """Analyze EBS metrics and determine idle status."""
-        indicators = []
-        days_since = last_activity.get('days_since_activity')
-        
-        grace_period = max(1, activity_threshold_days * ACTIVITY_GRACE_PERCENTAGE)
-        
+        # If active within grace period, mark as clearly active
         if days_since is not None and days_since < grace_period:
             return {
                 'idle_score': 0,

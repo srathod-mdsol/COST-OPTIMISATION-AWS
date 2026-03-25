@@ -1,4 +1,5 @@
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import re
 from core.config import Config
@@ -44,8 +45,12 @@ def setup_logger(name: str = __name__) -> logging.Logger:
         
         formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
         
-        # File Handler
-        file_handler = logging.FileHandler(Config.LOG_FILE)
+        # File Handler with rotation (max 10MB, keep 5 backup files)
+        file_handler = RotatingFileHandler(
+            Config.LOG_FILE,
+            maxBytes=10*1024*1024,  # 10MB
+            backupCount=5
+        )
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
         

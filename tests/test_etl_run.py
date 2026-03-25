@@ -14,7 +14,7 @@ import sys
 # Add current directory to path
 sys.path.insert(0, os.path.dirname(__file__))
 
-from etl_orchestrator import ETLOrchestrator
+from etl.orchestrator import ETLOrchestrator
 
 db_path = os.path.join(os.path.dirname(__file__), 'db', 'etl_database.db')
 
