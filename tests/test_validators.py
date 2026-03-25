@@ -6,7 +6,6 @@ import unittest
 from utils.validators import (
     validate_aws_region,
     validate_instance_id,
-    validate_s3_bucket_name,
     validate_activity_threshold_days,
     validate_idle_score,
     validate_service_type,
@@ -46,6 +45,16 @@ class TestValidateInstanceID(unittest.TestCase):
         """Test valid EC2 instance ID"""
         is_valid, error = validate_instance_id('i-1234567890abcdef', 'ec2')
         self.assertTrue(is_valid, f"Expected valid, got error: {error}")
+
+    def test_valid_ec2_instance_min_length(self):
+        """Test valid EC2 instance ID with minimum length"""
+        is_valid, error = validate_instance_id('i-12345678', 'ec2')
+        self.assertTrue(is_valid, f"Expected valid, got error: {error}")
+
+    def test_valid_ec2_instance_max_length(self):
+        """Test valid EC2 instance ID with maximum length"""
+        is_valid, error = validate_instance_id('i-1234567890abcdef1', 'ec2')
+        self.assertTrue(is_valid, f"Expected valid, got error: {error}")
     
     def test_invalid_ec2_instance(self):
         """Test invalid EC2 instance ID"""
@@ -56,35 +65,6 @@ class TestValidateInstanceID(unittest.TestCase):
         """Test valid RDS instance identifier"""
         is_valid, error = validate_instance_id('my-database', 'rds')
         self.assertTrue(is_valid)
-    
-    def test_valid_s3_bucket(self):
-        """Test valid S3 bucket name"""
-        is_valid, error = validate_instance_id('my-bucket', 's3')
-        self.assertTrue(is_valid)
-
-
-class TestValidateS3BucketName(unittest.TestCase):
-    """Tests for validate_s3_bucket_name function"""
-    
-    def test_valid_bucket_name(self):
-        """Test valid S3 bucket name"""
-        is_valid, error = validate_s3_bucket_name('my-bucket-123')
-        self.assertTrue(is_valid)
-    
-    def test_bucket_name_too_short(self):
-        """Test bucket name too short"""
-        is_valid, error = validate_s3_bucket_name('ab')
-        self.assertFalse(is_valid)
-    
-    def test_bucket_name_too_long(self):
-        """Test bucket name too long"""
-        is_valid, error = validate_s3_bucket_name('a' * 64)
-        self.assertFalse(is_valid)
-    
-    def test_bucket_name_uppercase(self):
-        """Test bucket name with uppercase"""
-        is_valid, error = validate_s3_bucket_name('MyBucket')
-        self.assertFalse(is_valid)
 
 
 class TestValidateActivityThresholdDays(unittest.TestCase):
@@ -132,13 +112,66 @@ class TestValidateServiceType(unittest.TestCase):
     
     def test_valid_services(self):
         """Test valid service types"""
-        for service in ['ec2', 'rds', 's3']:
+        for service in ['ec2', 'rds']:
             is_valid, error = validate_service_type(service)
             self.assertTrue(is_valid, f"Expected {service} to be valid")
     
+    def test_valid_services_case_insensitive(self):
+        """Test valid service types are case insensitive"""
+        for service in ['EC2', 'RDS', 'Ec2', 'rDs']:
+            is_valid, error = validate_service_type(service)
+            self.assertTrue(is_valid, f"Expected {service} to be valid (case insensitive)")
+
     def test_invalid_service(self):
         """Test invalid service type"""
         is_valid, error = validate_service_type('invalid')
+        self.assertFalse(is_valid)
+
+    def test_empty_service_type(self):
+        """Test empty service type"""
+        is_valid, error = validate_service_type('')
+        self.assertFalse(is_valid)
+        self.assertIn('empty', error.lower())
+
+
+class TestValidateHours(unittest.TestCase):
+    """Tests for validate_hours function"""
+
+    def test_valid_hours_default(self):
+        """Test valid hours with default max"""
+        from utils.validators import validate_hours
+        for hours in [1, 24, 72, 168]:
+            is_valid, error = validate_hours(hours)
+            self.assertTrue(is_valid, f"Expected {hours} to be valid")
+
+    def test_valid_hours_cloudwatch(self):
+        """Test valid hours for CloudWatch (max 90)"""
+        for hours in [1, 24, 90]:
+            is_valid, error = validate_cloudwatch_hours(hours)
+            self.assertTrue(is_valid, f"Expected {hours} to be valid for CloudWatch")
+
+    def test_invalid_hours_zero(self):
+        """Test hours cannot be zero"""
+        from utils.validators import validate_hours
+        is_valid, error = validate_hours(0)
+        self.assertFalse(is_valid)
+
+    def test_invalid_hours_negative(self):
+        """Test hours cannot be negative"""
+        from utils.validators import validate_hours
+        is_valid, error = validate_hours(-1)
+        self.assertFalse(is_valid)
+
+    def test_invalid_hours_non_integer(self):
+        """Test hours must be integer"""
+        from utils.validators import validate_hours
+        is_valid, error = validate_hours(24.5)
+        self.assertFalse(is_valid)
+        self.assertIn('integer', error.lower())
+
+    def test_invalid_cloudwatch_hours_exceeds_limit(self):
+        """Test CloudWatch hours cannot exceed 90"""
+        is_valid, error = validate_cloudwatch_hours(91)
         self.assertFalse(is_valid)
 
 

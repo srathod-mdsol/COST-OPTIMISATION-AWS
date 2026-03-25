@@ -21,7 +21,8 @@ cd "$SCRIPT_DIR"
 export PYTHONPATH="$SCRIPT_DIR:$PYTHONPATH"
 
 # Virtual environment path
-VENV_PATH="$SCRIPT_DIR/venv"
+# VENV_PATH="$SCRIPT_DIR/venv"
+VENV_PATH="/Users/SRD11/Desktop/PowerBIProject/venv"
 PYTHON="$VENV_PATH/bin/python"
 PIP="$VENV_PATH/bin/pip"
 

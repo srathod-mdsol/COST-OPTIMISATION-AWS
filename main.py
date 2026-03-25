@@ -33,6 +33,7 @@ def main():
         # Note: When running 'streamlit run main.py', this block will execute
         try:
             import streamlit as st
+            # Import directly from the dashboard.py file
             from ui.dashboard import main as dashboard_main
             dashboard_main()
         except ImportError as e:

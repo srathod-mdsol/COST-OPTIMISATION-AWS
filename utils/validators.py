@@ -66,38 +66,6 @@ def validate_instance_id(instance_id: str, service_type: str) -> Tuple[bool, Opt
     return True, None
 
 
-def validate_s3_bucket_name(bucket_name: str) -> Tuple[bool, Optional[str]]:
-    """
-    Validate S3 bucket name.
-    
-    Args:
-        bucket_name: S3 bucket name to validate
-        
-    Returns:
-        Tuple of (is_valid, error_message)
-    """
-    if not bucket_name:
-        return False, "Bucket name cannot be empty"
-    
-    # S3 bucket naming rules
-    if len(bucket_name) < 3 or len(bucket_name) > 63:
-        return False, f"Bucket name must be between 3 and 63 characters: {bucket_name}"
-    
-    if not re.match(r'^[a-z0-9][a-z0-9.-]*[a-z0-9]$', bucket_name):
-        return False, "Bucket name must be lowercase, can contain numbers, hyphens, and periods"
-    
-    # Check for reserved names
-    reserved_names = {'aws', 'amazon', 'alexa'}
-    if bucket_name.startswith('aws-') or bucket_name in reserved_names:
-        return False, f"Bucket name '{bucket_name}' is reserved"
-    
-    # IP address format check
-    if re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', bucket_name):
-        return False, "Bucket name cannot be an IP address"
-    
-    return True, None
-
-
 def validate_activity_threshold_days(days: int) -> Tuple[bool, Optional[str]]:
     """
     Validate activity threshold days value.
@@ -141,12 +109,12 @@ def validate_service_type(service_type: str) -> Tuple[bool, Optional[str]]:
     Validate AWS service type.
     
     Args:
-        service_type: Service type ('ec2', 'rds', 's3')
+        service_type: Service type ('ec2', 'rds')
         
     Returns:
         Tuple of (is_valid, error_message)
     """
-    valid_services = {'ec2', 'rds', 's3'}
+    valid_services = {'ec2', 'rds'}
     
     if not service_type:
         return False, "Service type cannot be empty"

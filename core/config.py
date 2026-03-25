@@ -7,7 +7,6 @@ from core.constants import (
     MAX_CONCURRENT_WORKERS,
     CLOUDWATCH_TIMEOUT_SECONDS,
     PRICING_BATCH_SIZE,
-    S3_STORAGE_COSTS,
     CPU_IDLE_THRESHOLD,
     CPU_CRITICAL_THRESHOLD,
     DB_CONNECTIONS_IDLE_THRESHOLD,
@@ -15,8 +14,7 @@ from core.constants import (
     DISK_READ_IDLE_THRESHOLD,
     DISK_WRITE_IDLE_THRESHOLD,
     READ_IOPS_IDLE_THRESHOLD,
-    WRITE_IOPS_IDLE_THRESHOLD,
-    S3_REQUESTS_IDLE_THRESHOLD
+    WRITE_IOPS_IDLE_THRESHOLD
 )
 
 # Load environment variables
@@ -36,7 +34,6 @@ class Config:
         - PRICING_JSON_DIR: Directory containing pricing JSON files
         - EC2_PRICING_JSON_PATH: Path to EC2 pricing JSON
         - RDS_PRICING_JSON_PATH: Path to RDS pricing JSON
-        - S3_PRICING_JSON_PATH: Path to S3 pricing JSON
     
     Example:
         >>> from core.config import Config
@@ -53,9 +50,9 @@ class Config:
     
     # Legacy support: Extract SQLite path from DATABASE_URL if applicable
     _database_url = DATABASE_URL
-    if _database_url.startswith('sqlite:///'):
+    if _database_url and _database_url.startswith('sqlite:///'):
         DEFAULT_ETL_DB_PATH = _database_url.replace('sqlite:///', '')
-    elif _database_url.startswith('file:'):
+    elif _database_url and _database_url.startswith('file:'):
         DEFAULT_ETL_DB_PATH = _database_url[5:]  # Remove 'file:' prefix
     else:
         # For non-SQLite databases or when DATABASE_URL is not set
@@ -158,7 +155,6 @@ class Config:
     PRICING_JSON_PATHS = {
         'ec2': os.environ.get('EC2_PRICING_JSON_PATH', os.path.join(PRICING_JSON_DIR, 'ec2_pricing.json')),
         'rds': os.environ.get('RDS_PRICING_JSON_PATH', os.path.join(PRICING_JSON_DIR, 'rds_pricing.json')),
-        's3': os.environ.get('S3_PRICING_JSON_PATH', os.path.join(PRICING_JSON_DIR, 's3_pricing.json')),
     }
     
     # Logging Configuration
@@ -171,9 +167,6 @@ class Config:
     MAX_WORKERS = MAX_CONCURRENT_WORKERS
     CLOUDWATCH_TIMEOUT = CLOUDWATCH_TIMEOUT_SECONDS
     
-    # S3 Storage Class Costs (from core/constants)
-    S3_STORAGE_CLASS_COSTS = S3_STORAGE_COSTS
-
     # Idle Thresholds
     CPU_IDLE_THRESHOLD = float(os.environ.get('CPU_IDLE_THRESHOLD', CPU_IDLE_THRESHOLD))
     CPU_CRITICAL_THRESHOLD = float(os.environ.get('CPU_CRITICAL_THRESHOLD', CPU_CRITICAL_THRESHOLD))
@@ -183,7 +176,6 @@ class Config:
     DISK_WRITE_IDLE_THRESHOLD = float(os.environ.get('DISK_WRITE_IDLE_THRESHOLD', DISK_WRITE_IDLE_THRESHOLD))
     READ_IOPS_IDLE_THRESHOLD = float(os.environ.get('READ_IOPS_IDLE_THRESHOLD', READ_IOPS_IDLE_THRESHOLD))
     WRITE_IOPS_IDLE_THRESHOLD = float(os.environ.get('WRITE_IOPS_IDLE_THRESHOLD', WRITE_IOPS_IDLE_THRESHOLD))
-    S3_REQUESTS_IDLE_THRESHOLD = float(os.environ.get('S3_REQUESTS_IDLE_THRESHOLD', S3_REQUESTS_IDLE_THRESHOLD))
 
     @classmethod
     def get_available_environments(cls):
@@ -286,3 +278,53 @@ class Config:
                 os.chmod(env_file, 0o600)
             except OSError:
                 pass
+
+    # Authentication Configuration
+    @classmethod
+    def get_admin_users(cls) -> dict:
+        """Get admin users from environment variable.
+        
+        Returns:
+            Dictionary mapping usernames to password hashes
+        """
+        admin_users_str = os.environ.get('ADMIN_USERS', '')
+        users = {}
+        
+        if not admin_users_str:
+            return users
+        
+        for user_entry in admin_users_str.split(','):
+            user_entry = user_entry.strip()
+            if ':' not in user_entry:
+                continue
+            
+            parts = user_entry.split(':', 1)
+            if len(parts) == 2:
+                username = parts[0].strip()
+                password_hash = parts[1].strip()
+                if username and password_hash:
+                    users[username] = password_hash
+        
+        return users
+    
+    @classmethod
+    def get_session_timeout_minutes(cls) -> int:
+        """Get session timeout in minutes from environment.
+        
+        Returns:
+            Session timeout in minutes (default: 10)
+        """
+        timeout_str = os.environ.get('SESSION_TIMEOUT_MINUTES', '10')
+        try:
+            return int(timeout_str)
+        except ValueError:
+            return 10
+    
+    @classmethod
+    def has_admin_users(cls) -> bool:
+        """Check if any admin users are configured.
+        
+        Returns:
+            True if ADMIN_USERS is set and contains valid users
+        """
+        return len(cls.get_admin_users()) > 0
