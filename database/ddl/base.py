@@ -195,7 +195,13 @@ class BaseDDL(ABC):
             "iops INTEGER",
             "throughput_mbps INTEGER",
             "encrypted TEXT",
-            "monthly_cost REAL"
+            "monthly_cost REAL",
+            # Extended EC2 attributes for accurate pricing
+            "platform TEXT",
+            "tenancy TEXT",
+            # Extended RDS attributes for accurate pricing  
+            "license_model TEXT",
+            "deployment_option TEXT"
         ]
     
     def get_raw_metrics_schema(self) -> List[str]:
@@ -255,7 +261,14 @@ class BaseDDL(ABC):
             "price_per_hour REAL",
             "currency TEXT",
             "service TEXT",
-            "raw_json TEXT"
+            "raw_json TEXT",
+            # Extended attributes for accurate pricing
+            "operating_system TEXT",
+            "tenancy TEXT",
+            "database_engine TEXT",
+            "deployment_option TEXT",
+            "license_model TEXT",
+            "pre_installed_sw TEXT"
         ]
     
     def get_ebs_pricing_schema(self) -> List[str]:

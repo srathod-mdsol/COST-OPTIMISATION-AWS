@@ -164,38 +164,43 @@ class MigrationManager:
         with SessionLocal() as session:
             for table in tables:
                 try:
-                    # Get column names
-                    old_cursor.execute(f"PRAGMA table_info({table})")
+                    # Validate table name to prevent SQL injection
+                    # Table names come from SQLite system table but we validate as a precaution
+                    if not table.isidentifier():
+                        raise ValueError(f"Invalid table name: {table}")
+
+                    # Get column names - use quoted identifier for safety
+                    old_cursor.execute(f"PRAGMA table_info('{table}')")
                     columns = [row['name'] for row in old_cursor.fetchall()]
-                    
-                    # Get data from old table
-                    old_cursor.execute(f"SELECT * FROM {table}")
+
+                    # Get data from old table - use quoted identifier for safety
+                    old_cursor.execute(f"SELECT * FROM '{table}'")
                     rows = old_cursor.fetchall()
-                    
+
                     if rows:
                         # Use raw SQL for inserting data
                         from sqlalchemy import text
-                        
+
                         placeholders = ', '.join([f':{col}' for col in columns])
                         column_names = ', '.join(columns)
-                        
+
                         for row in rows:
                             data = {col: row[col] for col in columns}
                             session.execute(
                                 text(f"INSERT INTO {table} ({column_names}) VALUES ({placeholders}) ON CONFLICT DO NOTHING"),
                                 data
                             )
-                        
+
                         migrated_counts[table] = len(rows)
                         print(f"Migrated {len(rows)} rows from {table}")
                     else:
                         migrated_counts[table] = 0
                         print(f"No data in {table}")
-                        
+
                 except Exception as e:
                     print(f"Error migrating {table}: {e}")
                     migrated_counts[table] = -1
-            
+
             session.commit()
         
         old_conn.close()

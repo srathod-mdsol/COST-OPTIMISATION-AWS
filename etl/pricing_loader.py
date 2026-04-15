@@ -13,68 +13,6 @@ from etl.base_db import BaseDatabase, DatabaseType
 
 logger = setup_logger(__name__)
 
-# AWS Location to Region Code mapping
-AWS_LOCATION_TO_REGION_MAP = {
-    # United States
-    'US East (N. Virginia)': 'us-east-1',
-    'US East (Ohio)': 'us-east-2',
-    'US West (N. California)': 'us-west-1',
-    'US West (Oregon)': 'us-west-2',
-
-    # Canada
-    'Canada (Central)': 'ca-central-1',
-    'Canada West (Calgary)': 'ca-west-1',
-
-    # Latin America
-    'South America (São Paulo)': 'sa-east-1',
-    'Mexico (Central)': 'mx-central-1',
-
-    # Europe
-    'EU (Ireland)': 'eu-west-1',
-    'EU (London)': 'eu-west-2',
-    'EU (Paris)': 'eu-west-3',
-    'EU (Frankfurt)': 'eu-central-1',
-    'EU (Zurich)': 'eu-central-2',
-    'EU (Stockholm)': 'eu-north-1',
-    'EU (Milan)': 'eu-south-1',
-    'EU (Spain)': 'eu-south-2',
-
-    # Asia Pacific — India
-    'Asia Pacific (Mumbai)': 'ap-south-1',
-    'Asia Pacific (Hyderabad)': 'ap-south-2',
-
-    # Asia Pacific — Southeast Asia
-    'Asia Pacific (Singapore)': 'ap-southeast-1',
-    'Asia Pacific (Sydney)': 'ap-southeast-2',
-    'Asia Pacific (Jakarta)': 'ap-southeast-3',
-    'Asia Pacific (Melbourne)': 'ap-southeast-4',
-    'Asia Pacific (Malaysia)': 'ap-southeast-5',
-    'Asia Pacific (Thailand)': 'ap-southeast-7',
-
-    # Asia Pacific — Northeast Asia
-    'Asia Pacific (Tokyo)': 'ap-northeast-1',
-    'Asia Pacific (Seoul)': 'ap-northeast-2',
-    'Asia Pacific (Osaka)': 'ap-northeast-3',
-    'Asia Pacific (Hong Kong)': 'ap-east-1',
-
-    # Middle East
-    'Middle East (Bahrain)': 'me-south-1',
-    'Middle East (UAE)': 'me-central-1',
-
-    # Israel
-    'Israel (Tel Aviv)': 'il-central-1',
-
-    # Africa
-    'Africa (Cape Town)': 'af-south-1',
-
-    # GovCloud
-    'AWS GovCloud (US-West)': 'us-gov-west-1',
-    'AWS GovCloud (US-East)': 'us-gov-east-1',
-
-    # China
-    'China (Beijing)': 'cn-north-1',
-    'China (Ningxia)': 'cn-northwest-1',
-}
 
 class PricingLoader(BaseDatabase):
     """
@@ -104,7 +42,14 @@ class PricingLoader(BaseDatabase):
             price_per_hour REAL,
             currency TEXT,
             service TEXT,
-            raw_json TEXT
+            raw_json TEXT,
+            -- Extended attributes for accurate pricing
+            operating_system TEXT,
+            tenancy TEXT,
+            database_engine TEXT,
+            deployment_option TEXT,
+            license_model TEXT,
+            pre_installed_sw TEXT
         )
         """
         self.execute(create_table_sql)
@@ -112,18 +57,27 @@ class PricingLoader(BaseDatabase):
         # Ensure 'service' column exists for older databases
         self.add_column_if_not_exists('aws_pricing', 'service', 'TEXT')
         
+        # Add new columns for extended pricing attributes
+        self.add_column_if_not_exists('aws_pricing', 'operating_system', 'TEXT')
+        self.add_column_if_not_exists('aws_pricing', 'tenancy', 'TEXT')
+        self.add_column_if_not_exists('aws_pricing', 'database_engine', 'TEXT')
+        self.add_column_if_not_exists('aws_pricing', 'deployment_option', 'TEXT')
+        self.add_column_if_not_exists('aws_pricing', 'license_model', 'TEXT')
+        self.add_column_if_not_exists('aws_pricing', 'pre_installed_sw', 'TEXT')
+        
         # Create index for faster lookups
         self.create_index_if_not_exists('idx_pricing_lookup', 'aws_pricing', ['instance_type', 'region', 'service'])
+        self.create_index_if_not_exists('idx_pricing_ec2_lookup', 'aws_pricing', ['instance_type', 'region', 'operating_system', 'tenancy'])
+        self.create_index_if_not_exists('idx_pricing_rds_lookup', 'aws_pricing', ['instance_type', 'region', 'database_engine', 'deployment_option'])
         
         logger.info("Pricing table schema verified")
 
-    def load_pricing(self, ec2_path=None, rds_path=None, s3_path=None, regions=None, chunk_size=None):
+    def load_pricing(self, ec2_path=None, rds_path=None, regions=None, chunk_size=None):
         """Load pricing data from provided JSON paths"""
         chunk_size = chunk_size or PRICING_BATCH_SIZE
         paths = [
             ('EC2', ec2_path or Config.PRICING_JSON_PATHS.get('ec2')),
-            ('RDS', rds_path or Config.PRICING_JSON_PATHS.get('rds')),
-            ('S3', s3_path or Config.PRICING_JSON_PATHS.get('s3'))
+            ('RDS', rds_path or Config.PRICING_JSON_PATHS.get('rds'))
         ]
         
         for service, json_path in paths:
@@ -152,8 +106,16 @@ class PricingLoader(BaseDatabase):
                         instance_type = attrs.get('instanceType') or attrs.get('instance_type')
                         location = attrs.get('location') or attrs.get('region')
                         
+                        # Extract extended pricing attributes
+                        operating_system = attrs.get('operatingSystem') or attrs.get('operating_system')
+                        tenancy = attrs.get('tenancy')
+                        database_engine = attrs.get('databaseEngine') or attrs.get('database_engine')
+                        deployment_option = attrs.get('deploymentOption') or attrs.get('deployment_option')
+                        license_model = attrs.get('licenseModel') or attrs.get('license_model')
+                        pre_installed_sw = attrs.get('preInstalledSw') or attrs.get('pre_installed_sw')
+                        
                         # Convert location name to region code if possible
-                        region_code = AWS_LOCATION_TO_REGION_MAP.get(location, location)
+                        region_code = AWS_LOCATION_TO_REGION.get(location, location)
                         
                         # Extract price from terms
                         price = 0.0
@@ -173,7 +135,11 @@ class PricingLoader(BaseDatabase):
                                 
                         if instance_type and location and price > 0:
                             # Store with location name for the region column
-                            rows.append((sku, instance_type, location, price, currency, service, json.dumps(offer)))
+                            # Also store extended attributes
+                            rows.append((
+                                sku, instance_type, location, price, currency, service, json.dumps(offer),
+                                operating_system, tenancy, database_engine, deployment_option, license_model, pre_installed_sw
+                            ))
                     
                     if rows:
                         self._insert_rows(rows)
@@ -189,69 +155,106 @@ class PricingLoader(BaseDatabase):
     def _insert_rows(self, rows):
         """Insert a batch of pricing rows into the database"""
         for row in rows:
-            sku, instance_type, region, price_per_hour, currency, service, raw_json = row
+            # Handle both old format (7 columns) and new format (13 columns)
+            if len(row) == 7:
+                sku, instance_type, region, price_per_hour, currency, service, raw_json = row
+                operating_system = None
+                tenancy = None
+                database_engine = None
+                deployment_option = None
+                license_model = None
+                pre_installed_sw = None
+            else:
+                sku, instance_type, region, price_per_hour, currency, service, raw_json, \
+                    operating_system, tenancy, database_engine, deployment_option, license_model, pre_installed_sw = row
             
             # Use database-agnostic upsert
             if self.db_type == DatabaseType.POSTGRESQL:
                 self.execute(
                     """
-                    INSERT INTO aws_pricing (sku, instance_type, region, price_per_hour, currency, service, raw_json)
-                    VALUES (:sku, :instance_type, :region, :price_per_hour, :currency, :service, :raw_json)
+                    INSERT INTO aws_pricing (sku, instance_type, region, price_per_hour, currency, service, raw_json,
+                        operating_system, tenancy, database_engine, deployment_option, license_model, pre_installed_sw)
+                    VALUES (:sku, :instance_type, :region, :price_per_hour, :currency, :service, :raw_json,
+                        :operating_system, :tenancy, :database_engine, :deployment_option, :license_model, :pre_installed_sw)
                     ON CONFLICT (sku) DO UPDATE SET
                         instance_type = EXCLUDED.instance_type,
                         region = EXCLUDED.region,
                         price_per_hour = EXCLUDED.price_per_hour,
                         currency = EXCLUDED.currency,
                         service = EXCLUDED.service,
-                        raw_json = EXCLUDED.raw_json
+                        raw_json = EXCLUDED.raw_json,
+                        operating_system = EXCLUDED.operating_system,
+                        tenancy = EXCLUDED.tenancy,
+                        database_engine = EXCLUDED.database_engine,
+                        deployment_option = EXCLUDED.deployment_option,
+                        license_model = EXCLUDED.license_model,
+                        pre_installed_sw = EXCLUDED.pre_installed_sw
                     """,
                     {
                         "sku": sku, "instance_type": instance_type, "region": region,
                         "price_per_hour": price_per_hour, "currency": currency,
-                        "service": service, "raw_json": raw_json
+                        "service": service, "raw_json": raw_json,
+                        "operating_system": operating_system, "tenancy": tenancy,
+                        "database_engine": database_engine, "deployment_option": deployment_option,
+                        "license_model": license_model, "pre_installed_sw": pre_installed_sw
                     }
                 )
             elif self.db_type == DatabaseType.MYSQL:
                 self.execute(
                     """
-                    INSERT INTO aws_pricing (sku, instance_type, region, price_per_hour, currency, service, raw_json)
-                    VALUES (:sku, :instance_type, :region, :price_per_hour, :currency, :service, :raw_json)
+                    INSERT INTO aws_pricing (sku, instance_type, region, price_per_hour, currency, service, raw_json,
+                        operating_system, tenancy, database_engine, deployment_option, license_model, pre_installed_sw)
+                    VALUES (:sku, :instance_type, :region, :price_per_hour, :currency, :service, :raw_json,
+                        :operating_system, :tenancy, :database_engine, :deployment_option, :license_model, :pre_installed_sw)
                     ON DUPLICATE KEY UPDATE
                         instance_type = VALUES(instance_type),
                         region = VALUES(region),
                         price_per_hour = VALUES(price_per_hour),
                         currency = VALUES(currency),
                         service = VALUES(service),
-                        raw_json = VALUES(raw_json)
+                        raw_json = VALUES(raw_json),
+                        operating_system = VALUES(operating_system),
+                        tenancy = VALUES(tenancy),
+                        database_engine = VALUES(database_engine),
+                        deployment_option = VALUES(deployment_option),
+                        license_model = VALUES(license_model),
+                        pre_installed_sw = VALUES(pre_installed_sw)
                     """,
                     {
                         "sku": sku, "instance_type": instance_type, "region": region,
                         "price_per_hour": price_per_hour, "currency": currency,
-                        "service": service, "raw_json": raw_json
+                        "service": service, "raw_json": raw_json,
+                        "operating_system": operating_system, "tenancy": tenancy,
+                        "database_engine": database_engine, "deployment_option": deployment_option,
+                        "license_model": license_model, "pre_installed_sw": pre_installed_sw
                     }
                 )
             else:
                 # SQLite and others
                 self.execute(
                     """
-                    INSERT OR REPLACE INTO aws_pricing (sku, instance_type, region, price_per_hour, currency, service, raw_json)
-                    VALUES (:sku, :instance_type, :region, :price_per_hour, :currency, :service, :raw_json)
+                    INSERT OR REPLACE INTO aws_pricing (sku, instance_type, region, price_per_hour, currency, service, raw_json,
+                        operating_system, tenancy, database_engine, deployment_option, license_model, pre_installed_sw)
+                    VALUES (:sku, :instance_type, :region, :price_per_hour, :currency, :service, :raw_json,
+                        :operating_system, :tenancy, :database_engine, :deployment_option, :license_model, :pre_installed_sw)
                     """,
                     {
                         "sku": sku, "instance_type": instance_type, "region": region,
                         "price_per_hour": price_per_hour, "currency": currency,
-                        "service": service, "raw_json": raw_json
+                        "service": service, "raw_json": raw_json,
+                        "operating_system": operating_system, "tenancy": tenancy,
+                        "database_engine": database_engine, "deployment_option": deployment_option,
+                        "license_model": license_model, "pre_installed_sw": pre_installed_sw
                     }
                 )
 
     @staticmethod
-    def run_etl(db_path=None, database_url=None, ec2_json_path=None, rds_json_path=None, s3_json_path=None, regions=None):
+    def run_etl(db_path=None, database_url=None, ec2_json_path=None, rds_json_path=None, regions=None):
         """Static wrapper for easy invocation from UI"""
         loader = PricingLoader(db_path=db_path, database_url=database_url)
         loader.load_pricing(
             ec2_path=ec2_json_path,
             rds_path=rds_json_path,
-            s3_path=s3_json_path,
             regions=regions
         )
 

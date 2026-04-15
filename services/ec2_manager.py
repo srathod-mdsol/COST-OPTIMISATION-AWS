@@ -37,6 +37,7 @@ class EC2Manager(BaseServiceManager):
                                 'instance_type': inst['InstanceType'],
                                 'name': name,
                                 'platform': inst.get('Platform', 'Linux/UNIX'),
+                                'tenancy': inst.get('Placement', {}).get('Tenancy', 'shared'),
                                 'status': inst['State']['Name'],
                                 'state': inst['State']['Name'],
                                 'availability_zone': az,
@@ -63,11 +64,20 @@ class EC2Manager(BaseServiceManager):
             instances = provider.list_instances('EC2', self.region)
             result = []
             for inst in instances:
+                # Parse raw_data to get additional fields
+                raw_data = inst.get('raw_data', {})
+                if isinstance(raw_data, str):
+                    try:
+                        raw_data = json.loads(raw_data)
+                    except:
+                        raw_data = {}
+                
                 res = {
                     'instance_id': inst.get('instance_id'),
                     'instance_type': inst.get('instance_class'),
                     'name': inst.get('name') or inst.get('instance_id'),
                     'platform': inst.get('platform', 'Linux/UNIX'),
+                    'tenancy': inst.get('tenancy', 'shared'),
                     'status': inst.get('status', 'unknown'),
                     'state': inst.get('status', 'unknown'),
                     'availability_zone': inst.get('availability_zone'),
@@ -82,7 +92,15 @@ class EC2Manager(BaseServiceManager):
                     'virtualization': inst.get('virtualization'),
                     'raw_data': inst.get('raw_data'),
                     'environment_tag': inst.get('environment_tag'),
-                    'region': inst.get('region', self.region)  # Ensure region is always present
+                    'region': inst.get('region', self.region),
+                    # New fields from raw_data
+                    'iam_role': raw_data.get('iam_role', ''),
+                    'instance_lifecycle': raw_data.get('instance_lifecycle', 'on-demand'),
+                    'total_ebs_storage_gb': raw_data.get('total_ebs_storage_gb', 0),
+                    'ebs_encrypted': raw_data.get('ebs_encrypted', False),
+                    'os_version': raw_data.get('os_version', 'Linux/UNIX'),
+                    'eol_date': raw_data.get('eol_date', ''),
+                    'eol_status': raw_data.get('eol_status', 'supported')
                 }
                 # Include any other fields (merged from raw_data in ETLDataProvider)
                 for k, v in inst.items():

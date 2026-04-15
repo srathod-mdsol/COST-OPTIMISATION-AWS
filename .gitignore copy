@@ -1,0 +1,58 @@
+# Environment files
+.env
+.env.local
+env
+!.env.example
+!.env.development
+!.env.production
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+db/
+dev.db
+data/
+
+# Logs
+logs/
+*.log
+dumps
+plans
+venv
+Archive.zip
+postgres_data
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+/data/(*).db
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+data/*
+.env*
+
+# Node.js
+node_modules/
+package-lock.json
+yarn.lock
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+
+# Backups
+*.zip
+*.bak
+*.backup
+*.copy
+*.copy [0-9]

@@ -37,7 +37,7 @@ def test_database_connection():
     """Test database connection"""
     print("\nTesting database connection...")
     
-    from etl_data_provider import create_data_provider
+    from etl.data_provider import create_data_provider
     
     db_path = os.path.join(os.path.dirname(__file__), 'db', 'etl_database.db')
     print(f"Database path: {db_path}")

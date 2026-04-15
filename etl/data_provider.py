@@ -3,9 +3,9 @@ import os
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Any
-from functools import lru_cache
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
+from cachetools import TTLCache
 
 from core.config import Config
 from core.logger import setup_logger
@@ -18,12 +18,12 @@ logger = setup_logger(__name__)
 # PERFORMANCE OPTIMIZATIONS
 # =============================================================================
 
-# Cache for pricing data (TTL = 1 hour - pricing rarely changes)
-_PRICING_CACHE: Dict[str, Any] = {}
-_PRICING_CACHE_TTL = 3600  # 1 hour (increased from 5 minutes)
-
 # Class-level pricing engine with connection pooling
 _pricing_engine: Optional[Engine] = None
+
+# Short TTL cache for pricing data (30 seconds) - balances accuracy with performance
+# Pricing data rarely changes, so 30s TTL is acceptable while ensuring freshness
+_pricing_ttl_cache = TTLCache(maxsize=1000, ttl=30)
 
 def _get_pricing_engine() -> Engine:
     """Get or create pooled pricing database engine.
@@ -57,12 +57,11 @@ class ETLDataProvider(BaseDatabase):
     
     Performance Optimizations:
     - Connection pooling for both main and pricing databases
-    - LRU caching for pricing lookups
+    - Direct database queries with MIN() for accurate pricing
     - Batch query support for metrics
-    - Increased cache TTL for pricing data
     """
     
-    def __init__(self, db_path: str = None, database_url: str = None, use_cache: bool = True):
+    def __init__(self, db_path: str = None, database_url: str = None):
         """Initialize ETL data provider with database path or URL"""
         # Determine database URL
         if database_url is None:
@@ -78,55 +77,7 @@ class ETLDataProvider(BaseDatabase):
         self._ensure_db_exists()
         # Ensure pricing database exists
         self._ensure_pricing_db_exists()
-        # Enable caching
-        self._use_cache = use_cache
-        self._init_cache()
     
-    def _init_cache(self):
-        """Initialize cache variables"""
-        global _PRICING_CACHE
-        _PRICING_CACHE = {
-            'pricing_data': {},
-            'instances': {},
-            'last_updated': time.time()
-        }
-    
-    def _get_from_cache(self, key: str) -> Optional[Any]:
-        """Get value from cache if not expired"""
-        if not self._use_cache:
-            return None
-        
-        cache_entry = _PRICING_CACHE.get(key)
-        if cache_entry is None:
-            return None
-        
-        # Check if cache is expired
-        if time.time() - _PRICING_CACHE.get('last_updated', 0) > _PRICING_CACHE_TTL:
-            return None
-        
-        return cache_entry
-    
-    def _set_cache(self, key: str, value: Any) -> None:
-        """Set value in cache"""
-        if not self._use_cache:
-            return
-        
-        global _PRICING_CACHE
-        _PRICING_CACHE[key] = value
-        _PRICING_CACHE['last_updated'] = time.time()
-    
-    def invalidate_cache(self) -> None:
-        """Invalidate all caches"""
-        global _PRICING_CACHE
-        _PRICING_CACHE = {
-            'pricing_data': {},
-            'instances': {},
-            'last_updated': time.time()
-        }
-        # Also clear LRU cache
-        self._get_pricing_cached.cache_clear()
-        logger.info("Cache invalidated")
-        
     def _ensure_db_exists(self):
         """Ensure the ETL database exists and has proper schema"""
         # For file-based databases (SQLite), create directory if needed
@@ -263,8 +214,9 @@ class ETLDataProvider(BaseDatabase):
     
     def get_data_freshness(self, service_type: str) -> Dict:
         """Get data freshness information for a service"""
+        # Use case-insensitive comparison
         row = self.fetch_one(
-            'SELECT last_updated, next_scheduled, record_count, status FROM data_freshness WHERE service_type = :service_type',
+            'SELECT last_updated, next_scheduled, record_count, status FROM data_freshness WHERE UPPER(service_type) = UPPER(:service_type)',
             {"service_type": service_type}
         )
         if row:
@@ -274,18 +226,32 @@ class ETLDataProvider(BaseDatabase):
                 'record_count': row[2],
                 'status': row[3]
             }
+        
+        # Fallback: Check raw_instances if data_freshness is empty
+        count_row = self.fetch_one(
+            'SELECT COUNT(*) as cnt FROM raw_instances WHERE UPPER(service_type) = UPPER(:service_type)',
+            {"service_type": service_type}
+        )
+        if count_row and count_row[0] > 0:
+            return {
+                'last_updated': 'Unknown',
+                'next_scheduled': 'Unknown',
+                'record_count': count_row[0],
+                'status': 'fresh'
+            }
         return None
     
     def list_instances(self, service_type: str, region: str = None) -> List[Dict]:
         """List all instances from database for a given service type"""
+        # Use case-insensitive comparison for service_type
         if region:
             rows = self.fetch_all(
-                'SELECT * FROM raw_instances WHERE service_type = :service_type AND region = :region ORDER BY instance_id',
+                'SELECT * FROM raw_instances WHERE UPPER(service_type) = UPPER(:service_type) AND region = :region ORDER BY instance_id',
                 {"service_type": service_type, "region": region}
             )
         else:
             rows = self.fetch_all(
-                'SELECT * FROM raw_instances WHERE service_type = :service_type ORDER BY instance_id',
+                'SELECT * FROM raw_instances WHERE UPPER(service_type) = UPPER(:service_type) ORDER BY instance_id',
                 {"service_type": service_type}
             )
         
@@ -540,8 +506,14 @@ class ETLDataProvider(BaseDatabase):
             return analysis
         return None
 
-    def truncate_and_reload(self, service_type: str = None, aws_environment: str = 'Default'):
-        """Truncate tables and trigger ETL reload with lock safety"""
+    def truncate_and_reload(self, service_type: str = None, aws_environment: str = 'Default', regions: List[str] = None):
+        """Truncate tables and trigger ETL reload with lock safety
+        
+        Args:
+            service_type: Optional service type to reload (e.g., 'RDS', 'EC2', 'EBS')
+            aws_environment: AWS environment name
+            regions: List of regions to fetch data from. If None, fetches all available regions.
+        """
         from etl.orchestrator import ETLOrchestrator
         orchestrator = ETLOrchestrator(database_url=self.database_url)
         
@@ -570,11 +542,12 @@ class ETLDataProvider(BaseDatabase):
             logger.error(f"Error truncating tables: {e}")
             raise
 
-        # Now trigger the reload
+        # Now trigger the reload - if regions is None, orchestrator will fetch all regions
         result = orchestrator.run_etl(
             run_type='manual', 
             triggered_by='streamlit_refresh', 
             services=[service_type] if service_type else None,
+            regions=regions,
             aws_environment=aws_environment
         )
         if result['status'] != 'success':
@@ -584,29 +557,73 @@ class ETLDataProvider(BaseDatabase):
             
         logger.info(f"ETL reload completed successfully: {result['records_loaded']} records loaded")
 
-    def get_pricing(self, instance_type: str, region: str, service: str = 'EC2') -> Optional[float]:
+    def get_pricing(self, instance_type: str, region: str, service: str = 'EC2',
+                   operating_system: str = None, tenancy: str = None,
+                   database_engine: str = None, deployment_option: str = None,
+                   license_model: str = None) -> Optional[float]:
         """
         Fetch hourly price for a given instance type, region, and service.
-        Results are cached for 1 hour to improve performance.
+        Uses short TTL cache (30s) for performance while ensuring reasonable freshness.
         
         Uses pooled database connection for better performance.
+        Uses MIN(price_per_hour) to always get the lowest available price.
         
         Handles multiple format variations:
         - RDS: Tries both with and without 'db.' prefix (e.g., 'db.t3.medium' and 't3.medium')
         - EC2: Tries case variations
-        - S3: Tries with and without 'Storage' suffix
+        
+        Args:
+            instance_type: The instance type (e.g., 't3.medium', 'db.r5.large')
+            region: The AWS region code (e.g., 'us-east-1')
+            service: The AWS service ('EC2', 'RDS')
+            operating_system: For EC2 - operating system (Linux, Windows, etc.)
+            tenancy: For EC2 - tenancy (shared, dedicated, host)
+            database_engine: For RDS - database engine (MySQL, PostgreSQL, etc.)
+            deployment_option: For RDS - Single-AZ or Multi-AZ
+            license_model: For RDS - license model (included, BYOL)
         """
+        # Normalize operating_system to match database values
+        # AWS pricing database uses: 'Linux', 'Windows', 'SUSE', 'RHEL', etc.
+        # But EC2 API returns: 'Linux/UNIX', 'Windows with SQL Server', etc.
+        if operating_system:
+            os_mapping = {
+                'Linux/UNIX': 'Linux',
+                'linux': 'Linux',
+                'LINUX': 'Linux',
+                'Windows with SQL Server Standard': 'Windows',
+                'Windows with SQL Server Enterprise': 'Windows',
+                'Windows with SQL Server Web': 'Windows',
+                'RHEL': 'RHEL',
+                'Red Hat Enterprise Linux': 'RHEL',
+                'SUSE': 'SUSE',
+            }
+            operating_system = os_mapping.get(operating_system, operating_system)
+        
         # Validate inputs
         if not instance_type or not region:
             logger.warning(f"Invalid pricing request: instance_type={instance_type}, region={region}")
             return None
         
-        # Check cache first
-        cache_key = f"{instance_type}:{region}:{service}"
-        cached_price = self._get_from_cache(f"pricing:{cache_key}")
-        if cached_price is not None:
-            logger.debug(f"Using cached price for {cache_key}")
-            return cached_price
+        # Build cache key from all parameters
+        cache_key = (
+            instance_type, region, service,
+            operating_system or 'any',
+            tenancy or 'any',
+            database_engine or 'any',
+            deployment_option or 'any',
+            license_model or 'any'
+        )
+        
+        # Check TTL cache first
+        if cache_key in _pricing_ttl_cache:
+            return _pricing_ttl_cache[cache_key]
+        
+        # Build parameter filters for query
+        os_key = operating_system or 'any'
+        tenancy_key = tenancy or 'any'
+        engine_key = database_engine or 'any'
+        deploy_key = deployment_option or 'any'
+        license_key = license_model or 'any'
         
         pricing_db_path = Config.get_pricing_db_path()
         
@@ -645,19 +662,16 @@ class ETLDataProvider(BaseDatabase):
             if instance_type != instance_type.upper():
                 instance_types_to_try.append(instance_type.upper())
         
-        elif service == 'S3':
-            # Try storage class name variations
-            if 'Storage' not in instance_type and instance_type:
-                instance_types_to_try.append(f'{instance_type}Storage')
-            if instance_type.endswith('Storage'):
-                instance_types_to_try.append(instance_type[:-7])  # Without 'Storage'
-        
         # Use pooled engine for pricing database
         engine = _get_pricing_engine()
         
         try:
             with engine.connect() as conn:
                 has_service = self._ensure_pricing_service_column_sqlalchemy(conn)
+                
+                # Check if extended columns exist
+                columns = self._get_pricing_columns(conn)
+                has_extended_cols = all(col in columns for col in ['operating_system', 'tenancy', 'database_engine', 'deployment_option'])
                 
                 # Try all combinations of instance_type variations and region values
                 # Priority: location_name first (if found), then region code
@@ -671,12 +685,43 @@ class ETLDataProvider(BaseDatabase):
                         if not region_value:  # Skip None values
                             continue
                         
-                        # Add filter for non-zero prices to avoid getting $0.00 pricing entries
-                        if has_service:
-                            query = text("SELECT price_per_hour FROM aws_pricing WHERE instance_type = :inst_type AND region = :region AND service = :service AND price_per_hour > 0 LIMIT 1")
+                        # Build query with extended filters if columns exist
+                        if has_extended_cols and (operating_system or tenancy or database_engine or deployment_option or license_model):
+                            # Build WHERE clause with filters
+                            where_clauses = ["instance_type = :inst_type", "region = :region", "price_per_hour > 0"]
+                            params = {"inst_type": inst_type, "region": region_value}
+                            
+                            if service:
+                                where_clauses.append("service = :service")
+                                params["service"] = service
+                            
+                            # Add optional filters - STRICT matching (no NULL fallback for specific values)
+                            # When a specific value is provided, ONLY match that value
+                            # NULL entries are only used when no filter is specified (generic pricing)
+                            if operating_system:
+                                where_clauses.append("operating_system = :operating_system")
+                                params["operating_system"] = operating_system
+                            if tenancy:
+                                where_clauses.append("tenancy = :tenancy")
+                                params["tenancy"] = tenancy
+                            if database_engine:
+                                where_clauses.append("database_engine = :database_engine")
+                                params["database_engine"] = database_engine
+                            if deployment_option:
+                                where_clauses.append("deployment_option = :deployment_option")
+                                params["deployment_option"] = deployment_option
+                            if license_model:
+                                where_clauses.append("license_model = :license_model")
+                                params["license_model"] = license_model
+                            
+                            # Use MIN(price_per_hour) to get the lowest On-Demand price for accurate cost savings calculation
+                            # This ensures deterministic pricing regardless of database ordering
+                            query = text("SELECT MIN(price_per_hour) FROM aws_pricing WHERE " + " AND ".join(where_clauses))
+                        elif has_service:
+                            query = text("SELECT MIN(price_per_hour) FROM aws_pricing WHERE instance_type = :inst_type AND region = :region AND service = :service AND price_per_hour > 0")
                             params = {"inst_type": inst_type, "region": region_value, "service": service}
                         else:
-                            query = text("SELECT price_per_hour FROM aws_pricing WHERE instance_type = :inst_type AND region = :region AND price_per_hour > 0 LIMIT 1")
+                            query = text("SELECT MIN(price_per_hour) FROM aws_pricing WHERE instance_type = :inst_type AND region = :region AND price_per_hour > 0")
                             params = {"inst_type": inst_type, "region": region_value}
                         
                         result = conn.execute(query, params)
@@ -684,17 +729,49 @@ class ETLDataProvider(BaseDatabase):
                         if row and row[0] is not None:
                             logger.debug(f"Pricing found: {service} {inst_type} in {region_value} = ${row[0]}/hour")
                             price = row[0]
-                            # Cache the result
-                            self._set_cache(f"pricing:{cache_key}", price)
+                            # Store in TTL cache before returning
+                            _pricing_ttl_cache[cache_key] = price
                             return price
+                        
+                        # FALLBACK: If strict matching returns no results, try with NULL values (generic pricing)
+                        # This handles cases where engine-specific pricing doesn't exist in the database
+                        if has_extended_cols and (database_engine or operating_system or tenancy or deployment_option or license_model):
+                            fallback_clauses = ["instance_type = :inst_type", "region = :region", "price_per_hour > 0"]
+                            fallback_params = {"inst_type": inst_type, "region": region_value}
+                            
+                            if service:
+                                fallback_clauses.append("service = :service")
+                                fallback_params["service"] = service
+                            
+                            # Only include filters where value is None (use NULL matching for fallback)
+                            if not operating_system:
+                                fallback_clauses.append("(operating_system IS NULL OR operating_system = 'any')")
+                            if not tenancy:
+                                fallback_clauses.append("(tenancy IS NULL OR tenancy = 'any')")
+                            if not database_engine:
+                                fallback_clauses.append("(database_engine IS NULL OR database_engine = 'any')")
+                            if not deployment_option:
+                                fallback_clauses.append("(deployment_option IS NULL OR deployment_option = 'any')")
+                            if not license_model:
+                                fallback_clauses.append("(license_model IS NULL OR license_model = 'any')")
+                            
+                            fallback_query = text("SELECT MIN(price_per_hour) FROM aws_pricing WHERE " + " AND ".join(fallback_clauses))
+                            fallback_result = conn.execute(fallback_query, fallback_params)
+                            fallback_row = fallback_result.fetchone()
+                            if fallback_row and fallback_row[0] is not None:
+                                logger.debug(f"Pricing found (fallback): {service} {inst_type} in {region_value} = ${fallback_row[0]}/hour (generic pricing)")
+                                price = fallback_row[0]
+                                _pricing_ttl_cache[cache_key] = price
+                                return price
                 
                 logger.warning(f"No pricing found for {service} {instance_type} in {region}. Tried variations: {instance_types_to_try} across regions: {regions_to_try}")
-                # Cache the "not found" result as well to avoid repeated lookups
-                self._set_cache(f"pricing:{cache_key}", None)
+                # Cache the not-found result too (with None value)
+                _pricing_ttl_cache[cache_key] = None
                 return None
                 
         except Exception as e:
             logger.error(f"Pricing database error: {e}. Run pricing ETL to initialize.")
+            # Don't cache errors - might be transient
             return None
 
     def _ensure_pricing_service_column_sqlalchemy(self, conn) -> bool:
@@ -768,6 +845,24 @@ class ETLDataProvider(BaseDatabase):
                 
         self._pricing_has_service_column = has_service
         return has_service
+    
+    def _get_pricing_columns(self, conn) -> List[str]:
+        """Get list of column names from aws_pricing table"""
+        from sqlalchemy import inspect
+        
+        try:
+            # Get the underlying engine from the connection
+            if hasattr(conn, 'engine'):
+                inspector = inspect(conn.engine)
+            elif hasattr(conn, 'connection') and hasattr(conn.connection, 'engine'):
+                inspector = inspect(conn.connection.engine)
+            else:
+                return []
+            
+            columns = [col['name'] for col in inspector.get_columns('aws_pricing')]
+            return columns
+        except Exception:
+            return []
 
     def list_ebs_volumes(self, region: str = None) -> List[Dict]:
         """List all EBS volumes from database"""
